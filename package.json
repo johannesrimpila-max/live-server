@@ -1,0 +1,16 @@
+{
+  "name": "live-server",
+  "version": "1.0.0",
+  "description": "Live-seuranta ottelusovellukselle",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "license": "MIT",
+  "dependencies": {
+    "express": "^4.19.2"
+  }
+}
