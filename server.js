@@ -10,46 +10,19 @@ app.use(express.json());
 
 const snapshots = new Map();
 
-app.post("/snapshot/:token", (req, res) => {
-  const token = req.params.token;
-  const {
-    home,
-    away,
-    homeScore,
-    awayScore,
-    clock,
-    homeXG,
-    awayXG,
-    homeShots,
-    awayShots,
-    homeCorners,
-    awayCorners,
-    homeColorHex,
-    awayColorHex,
-    dateISO,
-  } = req.body;
-
-  snapshots.set(token, {
-    home,
-    away,
-    homeScore,
-    awayScore,
-    clock,
-    homeXG,
-    awayXG,
-    homeShots,
-    awayShots,
-    homeCorners,
-    awayCorners,
-    homeColorHex,
-    awayColorHex,
-    dateISO,
-  });
-
-  res.status(204).end();
+app.post("/api/snapshot", (req, res) => {
+  const auth = req.headers["authorization"] || "";
+  const prefix = "Bearer ";
+  if (!auth.startsWith(prefix)) {
+    return res.status(401).json({ error: "Unauthorized: missing or invalid token" });
+  }
+  const token = auth.slice(prefix.length).trim();
+  const body = req.body || {};
+  snapshots.set(token, { ...body, updatedAt: new Date().toISOString() });
+  res.json({ ok: true });
 });
 
-app.get("/snapshot/:token", (req, res) => {
+app.get("/api/snapshot/:token", (req, res) => {
   const token = req.params.token;
   if (!snapshots.has(token)) {
     return res.status(404).json({ error: "Snapshot not found" });
@@ -64,29 +37,13 @@ app.get("/share/:token", (req, res) => {
   }
   const s = snapshots.get(token);
 
-  const possessionTotal =
-    (s.homeXG ?? 0) + (s.awayXG ?? 0) ||
-    (s.homeShots ?? 0) + (s.awayShots ?? 0) ||
-    1; // fallback to 1 to avoid division by zero
-
-  // Instead of possession total by xG or shots, we will produce possession bar based on xG as proxy (or shots if no xG)
-  // But instruction says a possession bar colored by homeColorHex and awayColorHex, so we interpret xG as possession proxy.
-
-  // We'll create a possession percentage for home
-  // To avoid zero total, fallback to 1 if total is 0
-
-  // Actually possession is not given, so we will take xG proportions as possession bar, fallback to shots proportion.
-
-  let homePossessionPercent = 50;
-  if ((s.homeXG ?? 0) + (s.awayXG ?? 0) > 0) {
-    homePossessionPercent =
-      ((s.homeXG ?? 0) / ((s.homeXG ?? 0) + (s.awayXG ?? 0))) * 100;
-  } else if ((s.homeShots ?? 0) + (s.awayShots ?? 0) > 0) {
-    homePossessionPercent =
-      ((s.homeShots ?? 0) / ((s.homeShots ?? 0) + (s.awayShots ?? 0))) * 100;
-  }
-
+  const homePossessionPercent = Math.max(0, Math.min(100, Number(s.possessionHomePct ?? 0)));
   const awayPossessionPercent = 100 - homePossessionPercent;
+
+  const secs = Number(s.matchSeconds ?? 0);
+  const mm = String(Math.floor(secs / 60)).padStart(2, '0');
+  const ss = String(secs % 60).padStart(2, '0');
+  const clockStr = `${mm}:${ss}`;
 
   const html = `<!DOCTYPE html>
 <html lang="en">
@@ -133,6 +90,7 @@ app.get("/share/:token", (req, res) => {
     font-size: 2rem;
     font-weight: 700;
   }
+  .final-label { margin-top: 4px; }
   .clock {
     text-align: center;
     font-size: 1.1rem;
@@ -196,10 +154,11 @@ app.get("/share/:token", (req, res) => {
 
     <div class="teams" aria-label="Teams and score">
       <div class="team home" style="color: ${s.homeColorHex}">${s.home}</div>
-      <div class="score" aria-live="polite">${s.homeScore} - ${s.awayScore}</div>
+      <div class="score" aria-live="polite">${s.scoreHome} - ${s.scoreAway}</div>
+      ${s.isEnded ? '<div class="final-label" style="text-align:center;color:#666;font-size:0.9rem;">Final</div>' : ''}
       <div class="team away" style="color: ${s.awayColorHex}">${s.away}</div>
     </div>
-    <div class="clock" aria-live="polite" aria-atomic="true">${s.clock}</div>
+    <div class="clock" aria-live="polite" aria-atomic="true">${clockStr}</div>
 
     <div class="possession-bar" aria-label="Possession bar">
       <div
@@ -244,10 +203,16 @@ app.get("/share/:token", (req, res) => {
 
   <script>
     // Poll every 2 seconds to update stats
+    function mmss(total) {
+      total = Math.max(0, total|0);
+      const m = String(Math.floor(total / 60)).padStart(2, '0');
+      const s = String(total % 60).padStart(2, '0');
+      return m + ':' + s;
+    }
     const token = ${JSON.stringify(token)};
     async function fetchStats() {
       try {
-        const res = await fetch('/snapshot/' + token);
+        const res = await fetch('/api/snapshot/' + token);
         if (!res.ok) return;
         const data = await res.json();
         // Update DOM with any changed values
@@ -258,8 +223,8 @@ app.get("/share/:token", (req, res) => {
         document.querySelector('.teams .team.home').style.color = data.homeColorHex;
         document.querySelector('.teams .team.away').textContent = data.away;
         document.querySelector('.teams .team.away').style.color = data.awayColorHex;
-        document.querySelector('.score').textContent = data.homeScore + ' - ' + data.awayScore;
-        document.querySelector('.clock').textContent = data.clock;
+        document.querySelector('.score').textContent = (data.scoreHome ?? 0) + ' - ' + (data.scoreAway ?? 0);
+        document.querySelector('.clock').textContent = mmss(data.matchSeconds ?? 0);
 
         // Possession calculation
         let homePossessionPercent = 50;
