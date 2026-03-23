@@ -179,7 +179,7 @@ setInterval(() => {
   }
 }, 15 * 60 * 1000);
 
-function renderSharePage(res, s) {
+function renderSharePage(res, s, originalId) {
   const { h: homePossessionPercent, a: awayPossessionPercent } = pickPossession(s);
 
   const secs = Number(s.matchSeconds ?? 0);
@@ -194,8 +194,10 @@ function renderSharePage(res, s) {
   const awayHex = s.awayColorHex || '#0A84FF';
   const metaLine = status === 'final' ? '' : `${s.half ?? 1}. puoliaika • ${clockStr}`;
 
-  // Refresh always by matchId so user stays on the selected match
-  const refreshId = s.matchId;
+  // Important:
+  // - if user opened /share/<token>, keep refreshing by token
+  // - if user opened /share/<matchId>, refresh by matchId
+  const refreshId = originalId || s.matchId;
 
   const html = `<!DOCTYPE html>
 <html lang="fi">
@@ -286,7 +288,23 @@ function renderSharePage(res, s) {
 
     async function refresh() {
       try {
-        const res = await fetch('/api/snapshot/' + encodeURIComponent(id));
+        const res = await fetch('/api/snapshot/' + encodeURIComponent(id), {
+          cache: 'no-store'
+        });
+
+        // If token now has multiple matches, reload page so /share/<token>
+        // becomes the selection page.
+        if (res.status === 409) {
+          window.location.reload();
+          return;
+        }
+
+        // If current match/token no longer resolves, reload.
+        if (res.status === 404) {
+          window.location.reload();
+          return;
+        }
+
         if (!res.ok) return;
 
         const data = await res.json();
@@ -417,6 +435,7 @@ app.get('/api/snapshot/:id', (req, res) => {
   }
 
   const tokenMatches = getMatchesForToken(id);
+
   if (tokenMatches.length === 1) {
     res.set('Cache-Control', 'no-store');
     return res.json(tokenMatches[0]);
@@ -509,14 +528,16 @@ app.get('/health', (req, res) => {
 app.get('/share/:id', (req, res) => {
   const id = String(req.params.id || '').trim();
 
+  // Direct matchId
   if (matches.has(id)) {
     const rec = matches.get(id);
     if (!rec || !isFresh(rec)) {
       return res.status(404).send('Snapshot not found');
     }
-    return renderSharePage(res, rec);
+    return renderSharePage(res, rec, id);
   }
 
+  // Token
   const tokenMatches = getMatchesForToken(id);
 
   if (tokenMatches.length === 0) {
@@ -524,9 +545,10 @@ app.get('/share/:id', (req, res) => {
   }
 
   if (tokenMatches.length === 1) {
-    return renderSharePage(res, tokenMatches[0]);
+    return renderSharePage(res, tokenMatches[0], id);
   }
 
+  // Multiple matches for token -> selection page
   const html = `<!doctype html>
 <html lang="fi">
 <head>
