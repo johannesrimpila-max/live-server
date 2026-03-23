@@ -1,14 +1,12 @@
-// server.js
-// Live server for FootballTracker snapshots + share & list pages (ES modules)
-import express from "express";
-import path from "path";
-import { fileURLToPath } from "url";
+'use strict';
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
+// server.js (CommonJS)
+// Live server for FootballTracker snapshots + share & list pages
+const express = require('express');
+const path = require('path');
 
 const app = express();
-app.use(express.json({ limit: "1mb" }));
+app.use(express.json({ limit: '1mb' }));
 
 // In-memory snapshot store: token -> snapshot (last one wins)
 const snapshots = new Map();
@@ -20,11 +18,11 @@ const TTL_MS = Number(process.env.LIVE_TTL_MS || TTL_HOURS * 60 * 60 * 1000);
 // Helper: possession picker (supports old/new keys)
 function pickPossession(obj = {}) {
   let h = 0, a = 0;
-  if (typeof obj.possessionHomePct === "number" && typeof obj.possessionAwayPct === "number") {
+  if (typeof obj.possessionHomePct === 'number' && typeof obj.possessionAwayPct === 'number') {
     h = obj.possessionHomePct; a = obj.possessionAwayPct;
-  } else if (obj.possession && typeof obj.possession.homePct === "number" && typeof obj.possession.awayPct === "number") {
+  } else if (obj.possession && typeof obj.possession.homePct === 'number' && typeof obj.possession.awayPct === 'number') {
     h = obj.possession.homePct; a = obj.possession.awayPct;
-  } else if (typeof obj.possessionHome === "number" && typeof obj.possessionAway === "number") {
+  } else if (typeof obj.possessionHome === 'number' && typeof obj.possessionAway === 'number') {
     h = obj.possessionHome; a = obj.possessionAway;
   } else {
     h = 0; a = 0;
@@ -52,67 +50,67 @@ setInterval(() => {
 }, 15 * 60 * 1000); // every 15 minutes
 
 // POST snapshot from the app (Bearer <token>)
-app.post("/api/snapshot", (req, res) => {
-  const auth = req.headers["authorization"] || "";
+app.post('/api/snapshot', (req, res) => {
+  const auth = req.headers['authorization'] || '';
   const m = auth.match(/^Bearer\s+(.*)$/i);
   if (!m) {
-    return res.status(401).json({ error: "Unauthorized: missing or invalid token" });
+    return res.status(401).json({ error: 'Unauthorized: missing or invalid token' });
   }
-  const token = String(m[1] || "").trim();
+  const token = String(m[1] || '').trim();
   if (!token) {
-    return res.status(401).json({ error: "Unauthorized: empty token" });
+    return res.status(401).json({ error: 'Unauthorized: empty token' });
   }
   const body = req.body || {};
   const nowISO = new Date().toISOString();
   const record = { ...body, updatedAt: nowISO };
   snapshots.set(token, record);
-  res.set("Cache-Control", "no-store");
+  res.set('Cache-Control', 'no-store');
   res.json({ ok: true, updatedAt: nowISO });
 });
 
 // GET snapshot JSON by path parameter
-app.get("/api/snapshot/:token", (req, res) => {
-  const token = String(req.params.token || "").trim();
+app.get('/api/snapshot/:token', (req, res) => {
+  const token = String(req.params.token || '').trim();
   const rec = snapshots.get(token);
   if (!rec) {
-    return res.status(404).json({ error: "Snapshot not found" });
+    return res.status(404).json({ error: 'Snapshot not found' });
   }
-  res.set("Cache-Control", "no-store");
+  res.set('Cache-Control', 'no-store');
   res.json(rec);
 });
 
 // GET snapshot JSON by query parameter (?token=...)
-app.get("/api/snapshot", (req, res) => {
-  const token = String(req.query.token || "").trim();
+app.get('/api/snapshot', (req, res) => {
+  const token = String(req.query.token || '').trim();
   const rec = snapshots.get(token);
   if (!token || !rec) {
-    return res.status(404).json({ error: "Snapshot not found" });
+    return res.status(404).json({ error: 'Snapshot not found' });
   }
-  res.set("Cache-Control", "no-store");
+  res.set('Cache-Control', 'no-store');
   res.json(rec);
 });
 
 // Alias JSON endpoint for share (optional)
-app.get("/api/share/:token", (req, res) => {
-  const token = String(req.params.token || "").trim();
+app.get('/api/share/:token', (req, res) => {
+  const token = String(req.params.token || '').trim();
   const rec = snapshots.get(token);
   if (!rec) {
-    return res.status(404).json({ error: "Snapshot not found" });
+    return res.status(404).json({ error: 'Snapshot not found' });
   }
-  res.set("Cache-Control", "no-store");
+  res.set('Cache-Control', 'no-store');
   res.json(rec);
 });
 
 // API: list matches updated within TTL (default 24h)
-app.get("/api/list", (req, res) => {
+app.get('/api/list', (req, res) => {
   const items = [];
   for (const [token, rec] of snapshots.entries()) {
     if (!isFresh(rec)) continue;
-    const status = rec.status || (rec.isEnded ? "final" : (rec.isPaused ? "paused" : "live"));
+    const status = rec.status || (rec.isEnded ? 'final' : (rec.isPaused ? 'paused' : 'live'));
     items.push({
       token,
-      home: rec.home || "Koti",
-      away: rec.away || "Vieras",
+      home: rec.home || 'Koti',
+      away: rec.away || 'Vieras',
       scoreHome: rec.scoreHome ?? 0,
       scoreAway: rec.scoreAway ?? 0,
       status,
@@ -120,39 +118,41 @@ app.get("/api/list", (req, res) => {
     });
   }
   items.sort((a, b) => Date.parse(b.updatedAt) - Date.parse(a.updatedAt));
-  res.set("Cache-Control", "no-store");
+  res.set('Cache-Control', 'no-store');
   res.json({ ttlMs: TTL_MS, nowISO: new Date().toISOString(), items });
 });
 
 // Root -> redirect to /list for convenience
-app.get("/", (req, res) => {
-  res.redirect(302, "/list");
+app.get('/', (req, res) => {
+  res.redirect(302, '/list');
 });
 
 // Simple health endpoint (if you need one)
-app.get("/health", (req, res) => {
-  res.type("text/plain").send("OK");
+app.get('/health', (req, res) => {
+  res.type('text/plain').send('OK');
 });
 
 // Share page with proper possession bar and 'Lopputulos' label
-app.get("/share/:token", (req, res) => {
-  const token = String(req.params.token || "").trim();
+app.get('/share/:token', (req, res) => {
+  const token = String(req.params.token || '').trim();
   const s = snapshots.get(token);
   if (!s) {
-    return res.status(404).send("Snapshot not found");
+    return res.status(404).send('Snapshot not found');
   }
   const { h: homePossessionPercent, a: awayPossessionPercent } = pickPossession(s);
 
   const secs = Number(s.matchSeconds ?? 0);
-  const mm = String(Math.floor(secs / 60)).padStart(2, "0");
-  const ss = String(secs % 60).padStart(2, "0");
+  const mm = String(Math.floor(secs / 60)).padStart(2, '0');
+  const ss = String(secs % 60).padStart(2, '0');
   const clockStr = `${mm}:${ss}`;
 
-  const status = s.status || (s.isEnded ? "final" : (s.isPaused ? "paused" : "live"));
-  const statusText = s.statusTextFi || (status === "final" ? "Lopputulos" : "");
+  const status = s.status || (s.isEnded ? 'final' : (s.isPaused ? 'paused' : 'live'));
+  const statusText = s.statusTextFi || (status === 'final' ? 'Lopputulos' : '');
 
-  const homeHex = s.homeColorHex || "#FF3B30";
-  const awayHex = s.awayColorHex || "#0A84FF";
+  const homeHex = s.homeColorHex || '#FF3B30';
+  const awayHex = s.awayColorHex || '#0A84FF';
+
+  const metaLine = (status === 'final') ? '' : `${s.half ?? 1}. puoliaika • ${clockStr}`;
 
   const html = `<!DOCTYPE html>
 <html lang="fi">
@@ -183,27 +183,27 @@ app.get("/share/:token", (req, res) => {
 <body>
   <div class="container" role="main" aria-label="Match Quick Stats">
     <header>
-      <div class="line">${s.home ?? "Koti"} ${s.scoreHome ?? 0} – ${s.scoreAway ?? 0} ${s.away ?? "Vieras"}</div>
+      <div class="line">${s.home ?? 'Koti'} ${s.scoreHome ?? 0} – ${s.scoreAway ?? 0} ${s.away ?? 'Vieras'}</div>
       <div class="status">${statusText}</div>
-      <div class="meta">${status === "final" ? "" : \`\${s.half ?? 1}. puoliaika • ${clockStr}\`}</div>
+      <div class="meta">${metaLine}</div>
     </header>
 
     <section class="possession" aria-label="Pallonhallinta">
       <div class="bar" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${homePossessionPercent}">
         <div class="fill" id="posFill"></div>
       </div>
-      <div class="legend"><span id="posHome">${s.home ?? "Koti"} ${homePossessionPercent}%</span><span id="posAway">${s.away ?? "Vieras"} ${awayPossessionPercent}%</span></div>
+      <div class="legend"><span id="posHome">${s.home ?? 'Koti'} ${homePossessionPercent}%</span><span id="posAway">${s.away ?? 'Vieras'} ${awayPossessionPercent}%</span></div>
     </section>
 
     <section class="stats-grid">
       <div class="side" style="color:${homeHex}">
-        <h3>${s.home ?? "Koti"}</h3>
+        <h3>${s.home ?? 'Koti'}</h3>
         <div class="item">🎯 xG <span class="val" id="homeXG">${Number(s.homeXG || 0).toFixed(2)}</span></div>
         <div class="item">⚽️ Laukaukset <span class="val" id="homeShots">${s.homeShots ?? 0}</span></div>
         <div class="item">🚩 Kulmapotkut <span class="val" id="homeCorners">${s.homeCorners ?? 0}</span></div>
       </div>
       <div class="side" style="text-align:right; color:${awayHex}">
-        <h3>${s.away ?? "Vieras"}</h3>
+        <h3>${s.away ?? 'Vieras'}</h3>
         <div class="item">🎯 xG <span class="val" id="awayXG">${Number(s.awayXG || 0).toFixed(2)}</span></div>
         <div class="item">⚽️ Laukaukset <span class="val" id="awayShots">${s.awayShots ?? 0}</span></div>
         <div class="item">🚩 Kulmapotkut <span class="val" id="awayCorners">${s.awayCorners ?? 0}</span></div>
@@ -261,21 +261,21 @@ app.get("/share/:token", (req, res) => {
   </script>
 </body>
 </html>`;
-  res.setHeader("Content-Type", "text/html; charset=utf-8");
-  res.setHeader("Cache-Control", "no-store");
+  res.setHeader('Content-Type', 'text/html; charset=utf-8');
+  res.setHeader('Cache-Control', 'no-store');
   res.send(html);
 });
 
 // List page: shows matches updated within TTL (default 24h)
-app.get("/list", (req, res) => {
+app.get('/list', (req, res) => {
   const items = [];
   for (const [token, rec] of snapshots.entries()) {
     if (!isFresh(rec)) continue;
-    const status = rec.status || (rec.isEnded ? "final" : (rec.isPaused ? "paused" : "live"));
+    const status = rec.status || (rec.isEnded ? 'final' : (rec.isPaused ? 'paused' : 'live'));
     items.push({
       token,
-      home: rec.home || "Koti",
-      away: rec.away || "Vieras",
+      home: rec.home || 'Koti',
+      away: rec.away || 'Vieras',
       scoreHome: rec.scoreHome ?? 0,
       scoreAway: rec.scoreAway ?? 0,
       status,
@@ -326,19 +326,19 @@ app.get("/list", (req, res) => {
             ${items.map(i => {
               const d = new Date(i.updatedAt);
               const dateStr = d.toLocaleString('fi-FI', { dateStyle: 'short', timeStyle: 'medium' });
-              const score = `${i.scoreHome} – ${i.scoreAway}`;
+              const score = \`${i.scoreHome} – ${i.scoreAway}\`;
               const statusFi = i.status === 'final' ? 'Lopputulos' : (i.status === 'paused' ? 'Tauko' : 'Käynnissä');
               const tok = encodeURIComponent(i.token);
-              return `<tr>
-                <td>${i.home} – ${i.away}</td>
-                <td>${score}</td>
-                <td class="status">${statusFi}</td>
-                <td class="status">${dateStr}</td>
-                <td class="links">
-                  <a href="/share/${tok}">Share-sivu</a>
-                  <a href="/api/snapshot/${tok}">JSON</a>
+              return \`<tr>
+                <td>\${i.home} – \${i.away}</td>
+                <td>\${score}</td>
+                <td class=\"status\">\${statusFi}</td>
+                <td class=\"status\">\${dateStr}</td>
+                <td class=\"links\">
+                  <a href=\"/share/\${tok}\">Share-sivu</a>
+                  <a href=\"/api/snapshot/\${tok}\">JSON</a>
                 </td>
-              </tr>`;
+              </tr>\`;
             }).join('')}
           </tbody>
         </table>`
@@ -346,13 +346,13 @@ app.get("/list", (req, res) => {
   </div>
 </body>
 </html>`;
-  res.setHeader("Content-Type", "text/html; charset=utf-8");
-  res.setHeader("Cache-Control", "no-store");
+  res.setHeader('Content-Type', 'text/html; charset=utf-8');
+  res.setHeader('Cache-Control', 'no-store');
   res.send(html);
 });
 
 // Optional: serve static assets if you add a /public folder later
-app.use(express.static(path.join(__dirname, "public")));
+app.use(express.static(path.join(__dirname, 'public')));
 
 // Port (Render.com usually provides PORT)
 const PORT = process.env.PORT || 10000;
