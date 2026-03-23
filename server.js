@@ -2,6 +2,7 @@
 
 // server.js (CommonJS)
 // Live server for FootballTracker snapshots + share & list pages
+
 const express = require('express');
 const path = require('path');
 
@@ -17,19 +18,40 @@ const TTL_MS = Number(process.env.LIVE_TTL_MS || TTL_HOURS * 60 * 60 * 1000);
 
 // Helper: possession picker (supports old/new keys)
 function pickPossession(obj = {}) {
-  let h = 0, a = 0;
-  if (typeof obj.possessionHomePct === 'number' && typeof obj.possessionAwayPct === 'number') {
-    h = obj.possessionHomePct; a = obj.possessionAwayPct;
-  } else if (obj.possession && typeof obj.possession.homePct === 'number' && typeof obj.possession.awayPct === 'number') {
-    h = obj.possession.homePct; a = obj.possession.awayPct;
-  } else if (typeof obj.possessionHome === 'number' && typeof obj.possessionAway === 'number') {
-    h = obj.possessionHome; a = obj.possessionAway;
+  let h = 0;
+  let a = 0;
+
+  if (
+    typeof obj.possessionHomePct === 'number' &&
+    typeof obj.possessionAwayPct === 'number'
+  ) {
+    h = obj.possessionHomePct;
+    a = obj.possessionAwayPct;
+  } else if (
+    obj.possession &&
+    typeof obj.possession.homePct === 'number' &&
+    typeof obj.possession.awayPct === 'number'
+  ) {
+    h = obj.possession.homePct;
+    a = obj.possession.awayPct;
+  } else if (
+    typeof obj.possessionHome === 'number' &&
+    typeof obj.possessionAway === 'number'
+  ) {
+    h = obj.possessionHome;
+    a = obj.possessionAway;
   } else {
-    h = 0; a = 0;
+    h = 0;
+    a = 0;
   }
+
   h = Math.max(0, Math.min(100, Number(h)));
   a = Math.max(0, Math.min(100, Number(a)));
-  if (h + a !== 100) a = 100 - h; // simple normalization
+
+  if (h + a !== 100) {
+    a = 100 - h; // simple normalization
+  }
+
   return { h, a };
 }
 
@@ -37,7 +59,7 @@ function isFresh(rec) {
   if (!rec || !rec.updatedAt) return false;
   const t = Date.parse(rec.updatedAt);
   if (Number.isNaN(t)) return false;
-  return (Date.now() - t) < TTL_MS;
+  return Date.now() - t < TTL_MS;
 }
 
 // Periodic cleanup to avoid unbounded growth
@@ -51,19 +73,25 @@ setInterval(() => {
 
 // POST snapshot from the app (Bearer <token>)
 app.post('/api/snapshot', (req, res) => {
-  const auth = req.headers['authorization'] || '';
+  const auth = req.headers.authorization || '';
   const m = auth.match(/^Bearer\s+(.*)$/i);
+
   if (!m) {
     return res.status(401).json({ error: 'Unauthorized: missing or invalid token' });
   }
+
   const token = String(m[1] || '').trim();
+
   if (!token) {
     return res.status(401).json({ error: 'Unauthorized: empty token' });
   }
+
   const body = req.body || {};
   const nowISO = new Date().toISOString();
   const record = { ...body, updatedAt: nowISO };
+
   snapshots.set(token, record);
+
   res.set('Cache-Control', 'no-store');
   res.json({ ok: true, updatedAt: nowISO });
 });
@@ -72,9 +100,11 @@ app.post('/api/snapshot', (req, res) => {
 app.get('/api/snapshot/:token', (req, res) => {
   const token = String(req.params.token || '').trim();
   const rec = snapshots.get(token);
+
   if (!rec) {
     return res.status(404).json({ error: 'Snapshot not found' });
   }
+
   res.set('Cache-Control', 'no-store');
   res.json(rec);
 });
@@ -83,9 +113,11 @@ app.get('/api/snapshot/:token', (req, res) => {
 app.get('/api/snapshot', (req, res) => {
   const token = String(req.query.token || '').trim();
   const rec = snapshots.get(token);
+
   if (!token || !rec) {
     return res.status(404).json({ error: 'Snapshot not found' });
   }
+
   res.set('Cache-Control', 'no-store');
   res.json(rec);
 });
@@ -94,9 +126,11 @@ app.get('/api/snapshot', (req, res) => {
 app.get('/api/share/:token', (req, res) => {
   const token = String(req.params.token || '').trim();
   const rec = snapshots.get(token);
+
   if (!rec) {
     return res.status(404).json({ error: 'Snapshot not found' });
   }
+
   res.set('Cache-Control', 'no-store');
   res.json(rec);
 });
@@ -104,9 +138,12 @@ app.get('/api/share/:token', (req, res) => {
 // API: list matches updated within TTL (default 24h)
 app.get('/api/list', (req, res) => {
   const items = [];
+
   for (const [token, rec] of snapshots.entries()) {
     if (!isFresh(rec)) continue;
-    const status = rec.status || (rec.isEnded ? 'final' : (rec.isPaused ? 'paused' : 'live'));
+
+    const status = rec.status || (rec.isEnded ? 'final' : rec.isPaused ? 'paused' : 'live');
+
     items.push({
       token,
       home: rec.home || 'Koti',
@@ -117,7 +154,9 @@ app.get('/api/list', (req, res) => {
       updatedAt: rec.updatedAt
     });
   }
+
   items.sort((a, b) => Date.parse(b.updatedAt) - Date.parse(a.updatedAt));
+
   res.set('Cache-Control', 'no-store');
   res.json({ ttlMs: TTL_MS, nowISO: new Date().toISOString(), items });
 });
@@ -127,7 +166,7 @@ app.get('/', (req, res) => {
   res.redirect(302, '/list');
 });
 
-// Simple health endpoint (if you need one)
+// Simple health endpoint
 app.get('/health', (req, res) => {
   res.type('text/plain').send('OK');
 });
@@ -136,9 +175,11 @@ app.get('/health', (req, res) => {
 app.get('/share/:token', (req, res) => {
   const token = String(req.params.token || '').trim();
   const s = snapshots.get(token);
+
   if (!s) {
     return res.status(404).send('Snapshot not found');
   }
+
   const { h: homePossessionPercent, a: awayPossessionPercent } = pickPossession(s);
 
   const secs = Number(s.matchSeconds ?? 0);
@@ -146,13 +187,13 @@ app.get('/share/:token', (req, res) => {
   const ss = String(secs % 60).padStart(2, '0');
   const clockStr = `${mm}:${ss}`;
 
-  const status = s.status || (s.isEnded ? 'final' : (s.isPaused ? 'paused' : 'live'));
+  const status = s.status || (s.isEnded ? 'final' : s.isPaused ? 'paused' : 'live');
   const statusText = s.statusTextFi || (status === 'final' ? 'Lopputulos' : '');
 
   const homeHex = s.homeColorHex || '#FF3B30';
   const awayHex = s.awayColorHex || '#0A84FF';
 
-  const metaLine = (status === 'final') ? '' : `${s.half ?? 1}. puoliaika • ${clockStr}`;
+  const metaLine = status === 'final' ? '' : `${s.half ?? 1}. puoliaika • ${clockStr}`;
 
   const html = `<!DOCTYPE html>
 <html lang="fi">
@@ -192,7 +233,10 @@ app.get('/share/:token', (req, res) => {
       <div class="bar" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${homePossessionPercent}">
         <div class="fill" id="posFill"></div>
       </div>
-      <div class="legend"><span id="posHome">${s.home ?? 'Koti'} ${homePossessionPercent}%</span><span id="posAway">${s.away ?? 'Vieras'} ${awayPossessionPercent}%</span></div>
+      <div class="legend">
+        <span id="posHome">${s.home ?? 'Koti'} ${homePossessionPercent}%</span>
+        <span id="posAway">${s.away ?? 'Vieras'} ${awayPossessionPercent}%</span>
+      </div>
     </section>
 
     <section class="stats-grid">
@@ -212,42 +256,68 @@ app.get('/share/:token', (req, res) => {
   </div>
 
   <script>
-    function pad(n){ return String(n).padStart(2,'0'); }
-    function mmss(sec){ sec = Math.max(0, sec|0); const m = Math.floor(sec/60), s = sec%60; return \`\${pad(m)}:\${pad(s)}\`; }
-    function pickPct(obj){
-      if (typeof obj.possessionHomePct === 'number' && typeof obj.possessionAwayPct === 'number') return { home: obj.possessionHomePct, away: obj.possessionAwayPct };
-      if (obj.possession && typeof obj.possession.homePct === 'number' && typeof obj.possession.awayPct === 'number') return { home: obj.possession.homePct, away: obj.possession.awayPct };
-      if (typeof obj.possessionHome === 'number' && typeof obj.possessionAway === 'number') return { home: obj.possessionHome, away: obj.possessionAway };
+    function pad(n) {
+      return String(n).padStart(2, '0');
+    }
+
+    function mmss(sec) {
+      sec = Math.max(0, sec | 0);
+      const m = Math.floor(sec / 60);
+      const s = sec % 60;
+      return pad(m) + ':' + pad(s);
+    }
+
+    function pickPct(obj) {
+      if (typeof obj.possessionHomePct === 'number' && typeof obj.possessionAwayPct === 'number') {
+        return { home: obj.possessionHomePct, away: obj.possessionAwayPct };
+      }
+      if (obj.possession && typeof obj.possession.homePct === 'number' && typeof obj.possession.awayPct === 'number') {
+        return { home: obj.possession.homePct, away: obj.possession.awayPct };
+      }
+      if (typeof obj.possessionHome === 'number' && typeof obj.possessionAway === 'number') {
+        return { home: obj.possessionHome, away: obj.possessionAway };
+      }
       return { home: 0, away: 0 };
     }
 
     const token = ${JSON.stringify(token)};
+
     async function refresh() {
       try {
         const res = await fetch('/api/snapshot/' + encodeURIComponent(token));
         if (!res.ok) return;
+
         const data = await res.json();
 
         // Scoreline & status
-        document.querySelector('header .line').textContent = \`\${data.home ?? 'Koti'} \${data.scoreHome ?? 0} – \${data.scoreAway ?? 0} \${data.away ?? 'Vieras'}\`;
-        const status = data.status || (data.isEnded ? 'final' : (data.isPaused ? 'paused' : 'live'));
-        const statusText = data.statusTextFi || (status === 'final' ? 'Lopputulos' : '');
-        document.querySelector('header .status').textContent = statusText || '';
-        document.querySelector('header .meta').textContent = (status === 'final') ? '' : \`\${data.half ?? 1}. puoliaika • \${mmss(data.matchSeconds ?? 0)}\`;
+        document.querySelector('header .line').textContent =
+          (data.home ?? 'Koti') + ' ' +
+          (data.scoreHome ?? 0) + ' – ' +
+          (data.scoreAway ?? 0) + ' ' +
+          (data.away ?? 'Vieras');
 
-        // Possession (always from data)
+        const status = data.status || (data.isEnded ? 'final' : data.isPaused ? 'paused' : 'live');
+        const statusText = data.statusTextFi || (status === 'final' ? 'Lopputulos' : '');
+
+        document.querySelector('header .status').textContent = statusText || '';
+        document.querySelector('header .meta').textContent =
+          status === 'final' ? '' : ((data.half ?? 1) + '. puoliaika • ' + mmss(data.matchSeconds ?? 0));
+
+        // Possession
         const pct = pickPct(data);
-        const homePct = Math.max(0, Math.min(100, pct.home|0));
-        const awayPct = Math.max(0, Math.min(100, pct.away|0));
+        const homePct = Math.max(0, Math.min(100, pct.home | 0));
+        const awayPct = Math.max(0, Math.min(100, pct.away | 0));
+
         const fill = document.getElementById('posFill');
         fill.style.width = homePct + '%';
         fill.style.background = (data.homeColorHex || '#0A84FF') + 'CC';
-        document.getElementById('posHome').textContent = \`\${data.home ?? 'Koti'} \${homePct}%\`;
-        document.getElementById('posAway').textContent = \`\${data.away ?? 'Vieras'} \${awayPct}%\`;
+
+        document.getElementById('posHome').textContent = (data.home ?? 'Koti') + ' ' + homePct + '%';
+        document.getElementById('posAway').textContent = (data.away ?? 'Vieras') + ' ' + awayPct + '%';
 
         // Quick stats
-        document.getElementById('homeXG').textContent = (Number(data.homeXG || 0)).toFixed(2);
-        document.getElementById('awayXG').textContent = (Number(data.awayXG || 0)).toFixed(2);
+        document.getElementById('homeXG').textContent = Number(data.homeXG || 0).toFixed(2);
+        document.getElementById('awayXG').textContent = Number(data.awayXG || 0).toFixed(2);
         document.getElementById('homeShots').textContent = String(data.homeShots ?? '0');
         document.getElementById('awayShots').textContent = String(data.awayShots ?? '0');
         document.getElementById('homeCorners').textContent = String(data.homeCorners ?? '0');
@@ -256,11 +326,13 @@ app.get('/share/:token', (req, res) => {
         // ignore
       }
     }
+
     refresh();
     setInterval(refresh, 2000);
   </script>
 </body>
 </html>`;
+
   res.setHeader('Content-Type', 'text/html; charset=utf-8');
   res.setHeader('Cache-Control', 'no-store');
   res.send(html);
@@ -269,9 +341,12 @@ app.get('/share/:token', (req, res) => {
 // List page: shows matches updated within TTL (default 24h)
 app.get('/list', (req, res) => {
   const items = [];
+
   for (const [token, rec] of snapshots.entries()) {
     if (!isFresh(rec)) continue;
-    const status = rec.status || (rec.isEnded ? 'final' : (rec.isPaused ? 'paused' : 'live'));
+
+    const status = rec.status || (rec.isEnded ? 'final' : rec.isPaused ? 'paused' : 'live');
+
     items.push({
       token,
       home: rec.home || 'Koti',
@@ -282,6 +357,7 @@ app.get('/list', (req, res) => {
       updatedAt: rec.updatedAt
     });
   }
+
   items.sort((a, b) => Date.parse(b.updatedAt) - Date.parse(a.updatedAt));
 
   const html = `<!doctype html>
@@ -311,41 +387,43 @@ app.get('/list', (req, res) => {
     <div class="hint">Näytetään ottelut, joita on päivitetty viimeisen ${TTL_HOURS} tunnin aikana.</div>
     ${
       items.length === 0
-      ? '<div class="empty">Ei aktiivisia otteluita. Päivitä sivu hetken päästä tai aloita uusi liveseuranta sovelluksesta.</div>'
-      : `<table>
-          <thead>
-            <tr>
-              <th>Ottelu</th>
-              <th>Tulos</th>
-              <th>Status</th>
-              <th>Päivitetty</th>
-              <th>Linkit</th>
-            </tr>
-          </thead>
-          <tbody>
-            ${items.map(i => {
-              const d = new Date(i.updatedAt);
-              const dateStr = d.toLocaleString('fi-FI', { dateStyle: 'short', timeStyle: 'medium' });
-              const score = \`${i.scoreHome} – ${i.scoreAway}\`;
-              const statusFi = i.status === 'final' ? 'Lopputulos' : (i.status === 'paused' ? 'Tauko' : 'Käynnissä');
-              const tok = encodeURIComponent(i.token);
-              return \`<tr>
-                <td>\${i.home} – \${i.away}</td>
-                <td>\${score}</td>
-                <td class=\"status\">\${statusFi}</td>
-                <td class=\"status\">\${dateStr}</td>
-                <td class=\"links\">
-                  <a href=\"/share/\${tok}\">Share-sivu</a>
-                  <a href=\"/api/snapshot/\${tok}\">JSON</a>
-                </td>
-              </tr>\`;
-            }).join('')}
-          </tbody>
-        </table>`
+        ? '<div class="empty">Ei aktiivisia otteluita. Päivitä sivu hetken päästä tai aloita uusi liveseuranta sovelluksesta.</div>'
+        : `<table>
+            <thead>
+              <tr>
+                <th>Ottelu</th>
+                <th>Tulos</th>
+                <th>Status</th>
+                <th>Päivitetty</th>
+                <th>Linkit</th>
+              </tr>
+            </thead>
+            <tbody>
+              ${items.map((i) => {
+                const d = new Date(i.updatedAt);
+                const dateStr = d.toLocaleString('fi-FI', { dateStyle: 'short', timeStyle: 'medium' });
+                const score = `${i.scoreHome} – ${i.scoreAway}`;
+                const statusFi = i.status === 'final' ? 'Lopputulos' : (i.status === 'paused' ? 'Tauko' : 'Käynnissä');
+                const tok = encodeURIComponent(i.token);
+
+                return `<tr>
+                  <td>${i.home} – ${i.away}</td>
+                  <td>${score}</td>
+                  <td class="status">${statusFi}</td>
+                  <td class="status">${dateStr}</td>
+                  <td class="links">
+                    <a href="/share/${tok}">Share-sivu</a>
+                    <a href="/api/snapshot/${tok}">JSON</a>
+                  </td>
+                </tr>`;
+              }).join('')}
+            </tbody>
+          </table>`
     }
   </div>
 </body>
 </html>`;
+
   res.setHeader('Content-Type', 'text/html; charset=utf-8');
   res.setHeader('Cache-Control', 'no-store');
   res.send(html);
