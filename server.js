@@ -1,16 +1,16 @@
 'use strict';
 
-// server.js (CommonJS)
-// Live server for FootballTracker snapshots + share & list pages
-
 const express = require('express');
 const path = require('path');
 
 const app = express();
 app.use(express.json({ limit: '1mb' }));
 
-// In-memory match store: matchId -> snapshot (last one wins per match)
+// Main storage: matchId -> latest snapshot for that match
 const matches = new Map();
+
+// Compatibility map: token -> latest/current matchId for that token
+const tokenToMatchId = new Map();
 
 // Retention: keep matches visible for last N hours (default 24h)
 const TTL_HOURS = Number(process.env.LIVE_TTL_HOURS || 24);
@@ -36,7 +36,6 @@ function extractMatchDate(obj = {}) {
     obj.startDate ||
     obj.gameDate ||
     obj.matchStart ||
-    obj.updatedAt ||
     new Date().toISOString();
 
   const d = new Date(raw);
@@ -54,7 +53,6 @@ function buildMatchId(obj = {}) {
   return `${date}_${home}_${away}`;
 }
 
-// Helper: possession picker (supports old/new keys)
 function pickPossession(obj = {}) {
   let h = 0;
   let a = 0;
@@ -78,16 +76,13 @@ function pickPossession(obj = {}) {
   ) {
     h = obj.possessionHome;
     a = obj.possessionAway;
-  } else {
-    h = 0;
-    a = 0;
   }
 
   h = Math.max(0, Math.min(100, Number(h)));
   a = Math.max(0, Math.min(100, Number(a)));
 
   if (h + a !== 100) {
-    a = 100 - h; // simple normalization
+    a = 100 - h;
   }
 
   return { h, a };
@@ -104,6 +99,24 @@ function getStatus(rec = {}) {
   return rec.status || (rec.isEnded ? 'final' : (rec.isPaused ? 'paused' : 'live'));
 }
 
+function resolveMatch(identifier = '') {
+  const key = String(identifier || '').trim();
+  if (!key) return null;
+
+  // 1) Direct matchId lookup
+  if (matches.has(key)) {
+    return matches.get(key);
+  }
+
+  // 2) Backward compatibility: token -> matchId
+  const mappedMatchId = tokenToMatchId.get(key);
+  if (mappedMatchId && matches.has(mappedMatchId)) {
+    return matches.get(mappedMatchId);
+  }
+
+  return null;
+}
+
 function listFreshMatches() {
   const items = [];
 
@@ -112,6 +125,7 @@ function listFreshMatches() {
 
     items.push({
       matchId,
+      token: rec.token || '',
       home: rec.home || rec.homeTeam || 'Koti',
       away: rec.away || rec.awayTeam || 'Vieras',
       scoreHome: rec.scoreHome ?? 0,
@@ -126,17 +140,22 @@ function listFreshMatches() {
   return items;
 }
 
-// Periodic cleanup to avoid unbounded growth
+// Cleanup
 setInterval(() => {
   for (const [matchId, rec] of matches.entries()) {
     if (!isFresh(rec)) {
       matches.delete(matchId);
     }
   }
+
+  for (const [token, matchId] of tokenToMatchId.entries()) {
+    if (!matches.has(matchId)) {
+      tokenToMatchId.delete(token);
+    }
+  }
 }, 15 * 60 * 1000);
 
-// POST snapshot from the app (Bearer <token>)
-// matchId is generated on the server from date + home + away
+// POST snapshot from app
 app.post('/api/snapshot', (req, res) => {
   const auth = req.headers.authorization || '';
   const m = auth.match(/^Bearer\s+(.*)$/i);
@@ -156,7 +175,7 @@ app.post('/api/snapshot', (req, res) => {
 
   if (!home || !away) {
     return res.status(400).json({
-      error: 'Missing team names: home and away are required to build matchId'
+      error: 'Missing team names: home and away are required'
     });
   }
 
@@ -177,15 +196,23 @@ app.post('/api/snapshot', (req, res) => {
   };
 
   matches.set(matchId, record);
+  tokenToMatchId.set(token, matchId);
 
   res.set('Cache-Control', 'no-store');
-  res.json({ ok: true, matchId, updatedAt: nowISO });
+  res.json({
+    ok: true,
+    token,
+    matchId,
+    shareUrl: `/share/${matchId}`,
+    legacyShareUrl: `/share/${token}`,
+    updatedAt: nowISO
+  });
 });
 
-// GET snapshot JSON by matchId path parameter
-app.get('/api/snapshot/:matchId', (req, res) => {
-  const matchId = String(req.params.matchId || '').trim();
-  const rec = matches.get(matchId);
+// GET snapshot JSON by identifier (matchId OR token)
+app.get('/api/snapshot/:id', (req, res) => {
+  const id = String(req.params.id || '').trim();
+  const rec = resolveMatch(id);
 
   if (!rec) {
     return res.status(404).json({ error: 'Snapshot not found' });
@@ -195,12 +222,14 @@ app.get('/api/snapshot/:matchId', (req, res) => {
   res.json(rec);
 });
 
-// GET snapshot JSON by query parameter (?matchId=...)
+// GET snapshot JSON by query parameter (?matchId=... or ?token=...)
 app.get('/api/snapshot', (req, res) => {
   const matchId = String(req.query.matchId || '').trim();
-  const rec = matches.get(matchId);
+  const token = String(req.query.token || '').trim();
+  const id = matchId || token;
+  const rec = resolveMatch(id);
 
-  if (!matchId || !rec) {
+  if (!id || !rec) {
     return res.status(404).json({ error: 'Snapshot not found' });
   }
 
@@ -208,10 +237,10 @@ app.get('/api/snapshot', (req, res) => {
   res.json(rec);
 });
 
-// Alias JSON endpoint for share (optional)
-app.get('/api/share/:matchId', (req, res) => {
-  const matchId = String(req.params.matchId || '').trim();
-  const rec = matches.get(matchId);
+// Alias JSON endpoint for share
+app.get('/api/share/:id', (req, res) => {
+  const id = String(req.params.id || '').trim();
+  const rec = resolveMatch(id);
 
   if (!rec) {
     return res.status(404).json({ error: 'Snapshot not found' });
@@ -221,27 +250,24 @@ app.get('/api/share/:matchId', (req, res) => {
   res.json(rec);
 });
 
-// API: list matches updated within TTL (default 24h)
 app.get('/api/list', (req, res) => {
   const items = listFreshMatches();
   res.set('Cache-Control', 'no-store');
   res.json({ ttlMs: TTL_MS, nowISO: new Date().toISOString(), items });
 });
 
-// Root -> redirect to /list for convenience
 app.get('/', (req, res) => {
   res.redirect(302, '/list');
 });
 
-// Simple health endpoint
 app.get('/health', (req, res) => {
   res.type('text/plain').send('OK');
 });
 
-// Share page with proper possession bar and 'Lopputulos' label
-app.get('/share/:matchId', (req, res) => {
-  const matchId = String(req.params.matchId || '').trim();
-  const s = matches.get(matchId);
+// Share page
+app.get('/share/:id', (req, res) => {
+  const id = String(req.params.id || '').trim();
+  const s = resolveMatch(id);
 
   if (!s) {
     return res.status(404).send('Snapshot not found');
@@ -259,7 +285,6 @@ app.get('/share/:matchId', (req, res) => {
 
   const homeHex = s.homeColorHex || '#FF3B30';
   const awayHex = s.awayColorHex || '#0A84FF';
-
   const metaLine = status === 'final' ? '' : `${s.half ?? 1}. puoliaika • ${clockStr}`;
 
   const html = `<!DOCTYPE html>
@@ -347,11 +372,11 @@ app.get('/share/:matchId', (req, res) => {
       return { home: 0, away: 0 };
     }
 
-    const matchId = ${JSON.stringify(matchId)};
+    const id = ${JSON.stringify(id)};
 
     async function refresh() {
       try {
-        const res = await fetch('/api/snapshot/' + encodeURIComponent(matchId));
+        const res = await fetch('/api/snapshot/' + encodeURIComponent(id));
         if (!res.ok) return;
 
         const data = await res.json();
@@ -402,7 +427,7 @@ app.get('/share/:matchId', (req, res) => {
   res.send(html);
 });
 
-// List page: shows matches updated within TTL (default 24h)
+// List page
 app.get('/list', (req, res) => {
   const items = listFreshMatches();
 
@@ -453,6 +478,7 @@ app.get('/list', (req, res) => {
                 const score = `${i.scoreHome} – ${i.scoreAway}`;
                 const statusFi = i.status === 'final' ? 'Lopputulos' : (i.status === 'paused' ? 'Tauko' : 'Käynnissä');
                 const mid = encodeURIComponent(i.matchId);
+                const tok = encodeURIComponent(i.token || '');
 
                 return `<tr>
                   <td>
@@ -465,6 +491,7 @@ app.get('/list', (req, res) => {
                   <td class="status">${dateStr}</td>
                   <td class="links">
                     <a href="/share/${mid}">Share-sivu</a>
+                    ${i.token ? `<a href="/share/${tok}">Vanha token-linkki</a>` : ''}
                     <a href="/api/snapshot/${mid}">JSON</a>
                   </td>
                 </tr>`;
@@ -481,10 +508,8 @@ app.get('/list', (req, res) => {
   res.send(html);
 });
 
-// Optional: serve static assets if you add a /public folder later
 app.use(express.static(path.join(__dirname, 'public')));
 
-// Port (Render.com usually provides PORT)
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
   console.log(`Server listening on port ${PORT}`);
