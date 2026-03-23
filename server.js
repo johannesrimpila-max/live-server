@@ -6,13 +6,13 @@ const path = require('path');
 const app = express();
 app.use(express.json({ limit: '1mb' }));
 
-// Main storage: matchId -> latest snapshot for that match
+// matchId -> latest snapshot for that match
 const matches = new Map();
 
-// Compatibility/grouping: token -> Set of matchIds
+// token -> Set of matchIds
 const tokenToMatchIds = new Map();
 
-// Retention: keep matches visible for last N hours (default 24h)
+// Keep matches visible for last N hours
 const TTL_HOURS = Number(process.env.LIVE_TTL_HOURS || 24);
 const TTL_MS = Number(process.env.LIVE_TTL_MS || TTL_HOURS * 60 * 60 * 1000);
 
@@ -26,31 +26,11 @@ function slugify(str = '') {
     .replace(/^-+|-+$/g, '');
 }
 
-function extractMatchDate(obj = {}) {
-  const raw =
-    obj.matchDate ||
-    obj.date ||
-    obj.kickoffDate ||
-    obj.kickoff ||
-    obj.startTime ||
-    obj.startDate ||
-    obj.gameDate ||
-    obj.matchStart ||
-    new Date().toISOString();
-
-  const d = new Date(raw);
-  if (Number.isNaN(d.getTime())) {
-    return new Date().toISOString().slice(0, 10);
-  }
-
-  return d.toISOString().slice(0, 10); // YYYY-MM-DD
-}
-
+// Match ID is based only on home + away teams
 function buildMatchId(obj = {}) {
-  const date = extractMatchDate(obj);
   const home = slugify(obj.home || obj.homeTeam || 'koti');
   const away = slugify(obj.away || obj.awayTeam || 'vieras');
-  return `${date}_${home}_${away}`;
+  return `${home}__${away}`;
 }
 
 function pickPossession(obj = {}) {
@@ -88,15 +68,15 @@ function pickPossession(obj = {}) {
   return { h, a };
 }
 
+function getStatus(rec = {}) {
+  return rec.status || (rec.isEnded ? 'final' : (rec.isPaused ? 'paused' : 'live'));
+}
+
 function isFresh(rec) {
   if (!rec || !rec.updatedAt) return false;
   const t = Date.parse(rec.updatedAt);
   if (Number.isNaN(t)) return false;
-  return Date.now() - t < TTL_MS;
-}
-
-function getStatus(rec = {}) {
-  return rec.status || (rec.isEnded ? 'final' : (rec.isPaused ? 'paused' : 'live'));
+  return (Date.now() - t) < TTL_MS;
 }
 
 function getMatchesForToken(token = '') {
@@ -104,7 +84,7 @@ function getMatchesForToken(token = '') {
   if (!key) return [];
 
   const ids = tokenToMatchIds.get(key);
-  if (!ids || !ids.size) return [];
+  if (!ids || ids.size === 0) return [];
 
   const out = [];
   for (const matchId of ids) {
@@ -118,16 +98,15 @@ function getMatchesForToken(token = '') {
   return out;
 }
 
-function resolveMatch(identifier = '') {
-  const key = String(identifier || '').trim();
+function getMatchByIdentifier(id = '') {
+  const key = String(id || '').trim();
   if (!key) return null;
 
-  // Direct matchId lookup
   if (matches.has(key)) {
-    return matches.get(key);
+    const rec = matches.get(key);
+    return isFresh(rec) ? rec : null;
   }
 
-  // Token lookup: if exactly one active match, return it directly
   const tokenMatches = getMatchesForToken(key);
   if (tokenMatches.length === 1) {
     return tokenMatches[0];
@@ -150,8 +129,7 @@ function listFreshMatches() {
       scoreHome: rec.scoreHome ?? 0,
       scoreAway: rec.scoreAway ?? 0,
       status: getStatus(rec),
-      updatedAt: rec.updatedAt,
-      matchDate: rec.matchDate || extractMatchDate(rec)
+      updatedAt: rec.updatedAt
     });
   }
 
@@ -159,17 +137,39 @@ function listFreshMatches() {
   return items;
 }
 
-// Cleanup
+function attachMatchToToken(token, matchId) {
+  let ids = tokenToMatchIds.get(token);
+  if (!ids) {
+    ids = new Set();
+    tokenToMatchIds.set(token, ids);
+  }
+  ids.add(matchId);
+}
+
+function removeMatchFromToken(token, matchId) {
+  const ids = tokenToMatchIds.get(token);
+  if (!ids) return;
+  ids.delete(matchId);
+  if (ids.size === 0) {
+    tokenToMatchIds.delete(token);
+  }
+}
+
+// Cleanup old matches every 15 min
 setInterval(() => {
   for (const [matchId, rec] of matches.entries()) {
     if (!isFresh(rec)) {
       matches.delete(matchId);
+      if (rec && rec.token) {
+        removeMatchFromToken(rec.token, matchId);
+      }
     }
   }
 
   for (const [token, ids] of tokenToMatchIds.entries()) {
     for (const matchId of ids) {
-      if (!matches.has(matchId)) {
+      const rec = matches.get(matchId);
+      if (!rec || !isFresh(rec)) {
         ids.delete(matchId);
       }
     }
@@ -194,7 +194,7 @@ function renderSharePage(res, s) {
   const awayHex = s.awayColorHex || '#0A84FF';
   const metaLine = status === 'final' ? '' : `${s.half ?? 1}. puoliaika • ${clockStr}`;
 
-  // Always refresh by matchId so the page stays on the same match
+  // Refresh always by matchId so user stays on the selected match
   const refreshId = s.matchId;
 
   const html = `<!DOCTYPE html>
@@ -361,11 +361,12 @@ app.post('/api/snapshot', (req, res) => {
     });
   }
 
-  const matchDate = extractMatchDate(body);
-  const matchId = buildMatchId({ ...body, home, away, matchDate });
+  const matchId = buildMatchId({ ...body, home, away });
   const nowISO = new Date().toISOString();
 
   const prev = matches.get(matchId) || {};
+  const prevToken = prev.token ? String(prev.token) : '';
+
   const record = {
     ...prev,
     ...body,
@@ -373,18 +374,23 @@ app.post('/api/snapshot', (req, res) => {
     away,
     token,
     matchId,
-    matchDate,
     updatedAt: nowISO
   };
 
   matches.set(matchId, record);
 
-  let ids = tokenToMatchIds.get(token);
-  if (!ids) {
-    ids = new Set();
-    tokenToMatchIds.set(token, ids);
+  if (prevToken && prevToken !== token) {
+    removeMatchFromToken(prevToken, matchId);
   }
-  ids.add(matchId);
+
+  attachMatchToToken(token, matchId);
+
+  console.log('SNAPSHOT IN', {
+    token,
+    home,
+    away,
+    matchId
+  });
 
   res.set('Cache-Control', 'no-store');
   res.json({
@@ -397,43 +403,90 @@ app.post('/api/snapshot', (req, res) => {
   });
 });
 
-// GET snapshot JSON by identifier (matchId OR token if exactly one match)
+// GET snapshot JSON by identifier
 app.get('/api/snapshot/:id', (req, res) => {
   const id = String(req.params.id || '').trim();
-  const rec = resolveMatch(id);
 
-  if (!rec) {
-    return res.status(404).json({ error: 'Snapshot not found' });
+  if (matches.has(id)) {
+    const rec = matches.get(id);
+    if (!rec || !isFresh(rec)) {
+      return res.status(404).json({ error: 'Snapshot not found' });
+    }
+    res.set('Cache-Control', 'no-store');
+    return res.json(rec);
   }
 
-  res.set('Cache-Control', 'no-store');
-  res.json(rec);
+  const tokenMatches = getMatchesForToken(id);
+  if (tokenMatches.length === 1) {
+    res.set('Cache-Control', 'no-store');
+    return res.json(tokenMatches[0]);
+  }
+
+  if (tokenMatches.length > 1) {
+    return res.status(409).json({
+      error: 'Multiple matches found for token',
+      items: tokenMatches.map((m) => ({
+        matchId: m.matchId,
+        home: m.home || 'Koti',
+        away: m.away || 'Vieras',
+        scoreHome: m.scoreHome ?? 0,
+        scoreAway: m.scoreAway ?? 0,
+        status: getStatus(m),
+        updatedAt: m.updatedAt
+      }))
+    });
+  }
+
+  return res.status(404).json({ error: 'Snapshot not found' });
 });
 
 // GET snapshot JSON by query parameter (?matchId=... or ?token=...)
 app.get('/api/snapshot', (req, res) => {
   const matchId = String(req.query.matchId || '').trim();
   const token = String(req.query.token || '').trim();
-  const id = matchId || token;
-  const rec = resolveMatch(id);
 
-  if (!id || !rec) {
-    return res.status(404).json({ error: 'Snapshot not found' });
+  if (matchId) {
+    const rec = matches.get(matchId);
+    if (!rec || !isFresh(rec)) {
+      return res.status(404).json({ error: 'Snapshot not found' });
+    }
+    res.set('Cache-Control', 'no-store');
+    return res.json(rec);
   }
 
-  res.set('Cache-Control', 'no-store');
-  res.json(rec);
+  if (token) {
+    const tokenMatches = getMatchesForToken(token);
+
+    if (tokenMatches.length === 1) {
+      res.set('Cache-Control', 'no-store');
+      return res.json(tokenMatches[0]);
+    }
+
+    if (tokenMatches.length > 1) {
+      return res.status(409).json({
+        error: 'Multiple matches found for token',
+        items: tokenMatches.map((m) => ({
+          matchId: m.matchId,
+          home: m.home || 'Koti',
+          away: m.away || 'Vieras',
+          scoreHome: m.scoreHome ?? 0,
+          scoreAway: m.scoreAway ?? 0,
+          status: getStatus(m),
+          updatedAt: m.updatedAt
+        }))
+      });
+    }
+  }
+
+  return res.status(404).json({ error: 'Snapshot not found' });
 });
 
 // Alias JSON endpoint
 app.get('/api/share/:id', (req, res) => {
-  const id = String(req.params.id || '').trim();
-  const rec = resolveMatch(id);
-
+  const rec = getMatchByIdentifier(req.params.id || '');
   if (!rec) {
     return res.status(404).json({ error: 'Snapshot not found' });
   }
-
   res.set('Cache-Control', 'no-store');
   res.json(rec);
 });
@@ -456,12 +509,14 @@ app.get('/health', (req, res) => {
 app.get('/share/:id', (req, res) => {
   const id = String(req.params.id || '').trim();
 
-  // Direct matchId
   if (matches.has(id)) {
-    return renderSharePage(res, matches.get(id));
+    const rec = matches.get(id);
+    if (!rec || !isFresh(rec)) {
+      return res.status(404).send('Snapshot not found');
+    }
+    return renderSharePage(res, rec);
   }
 
-  // Token -> one or many matches
   const tokenMatches = getMatchesForToken(id);
 
   if (tokenMatches.length === 0) {
@@ -499,7 +554,7 @@ app.get('/share/:id', (req, res) => {
       const statusFi = status === 'final' ? 'Lopputulos' : (status === 'paused' ? 'Tauko' : 'Käynnissä');
       return `<div class="card">
         <div class="line">${s.home ?? 'Koti'} ${s.scoreHome ?? 0} – ${s.scoreAway ?? 0} ${s.away ?? 'Vieras'}</div>
-        <div class="meta">${s.matchDate || extractMatchDate(s)} • ${statusFi}</div>
+        <div class="meta">${statusFi}</div>
         <a href="/share/${encodeURIComponent(s.matchId)}">Avaa ottelu</a>
       </div>`;
     }).join('')}
@@ -551,7 +606,6 @@ app.get('/list', (req, res) => {
                 <th>Ottelu</th>
                 <th>Tulos</th>
                 <th>Status</th>
-                <th>Ottelupäivä</th>
                 <th>Päivitetty</th>
                 <th>Linkit</th>
               </tr>
@@ -572,7 +626,6 @@ app.get('/list', (req, res) => {
                   </td>
                   <td>${score}</td>
                   <td class="status">${statusFi}</td>
-                  <td class="status">${i.matchDate}</td>
                   <td class="status">${dateStr}</td>
                   <td class="links">
                     <a href="/share/${mid}">Share-sivu</a>
