@@ -1,3 +1,5 @@
+// server.js
+// Live server for FootballTracker snapshots + share & list pages (ES modules)
 import express from "express";
 import path from "path";
 import { fileURLToPath } from "url";
@@ -6,271 +8,353 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const app = express();
-app.use(express.json());
+app.use(express.json({ limit: "1mb" }));
 
+// In-memory snapshot store: token -> snapshot (last one wins)
 const snapshots = new Map();
 
+// Retention: keep matches visible for last N hours (default 24h)
+const TTL_HOURS = Number(process.env.LIVE_TTL_HOURS || 24);
+const TTL_MS = Number(process.env.LIVE_TTL_MS || TTL_HOURS * 60 * 60 * 1000);
+
+// Helper: possession picker (supports old/new keys)
+function pickPossession(obj = {}) {
+  let h = 0, a = 0;
+  if (typeof obj.possessionHomePct === "number" && typeof obj.possessionAwayPct === "number") {
+    h = obj.possessionHomePct; a = obj.possessionAwayPct;
+  } else if (obj.possession && typeof obj.possession.homePct === "number" && typeof obj.possession.awayPct === "number") {
+    h = obj.possession.homePct; a = obj.possession.awayPct;
+  } else if (typeof obj.possessionHome === "number" && typeof obj.possessionAway === "number") {
+    h = obj.possessionHome; a = obj.possessionAway;
+  } else {
+    h = 0; a = 0;
+  }
+  h = Math.max(0, Math.min(100, Number(h)));
+  a = Math.max(0, Math.min(100, Number(a)));
+  if (h + a !== 100) a = 100 - h; // simple normalization
+  return { h, a };
+}
+
+function isFresh(rec) {
+  if (!rec || !rec.updatedAt) return false;
+  const t = Date.parse(rec.updatedAt);
+  if (Number.isNaN(t)) return false;
+  return (Date.now() - t) < TTL_MS;
+}
+
+// Periodic cleanup to avoid unbounded growth
+setInterval(() => {
+  for (const [token, rec] of snapshots.entries()) {
+    if (!isFresh(rec)) {
+      snapshots.delete(token);
+    }
+  }
+}, 15 * 60 * 1000); // every 15 minutes
+
+// POST snapshot from the app (Bearer <token>)
 app.post("/api/snapshot", (req, res) => {
   const auth = req.headers["authorization"] || "";
-  const prefix = "Bearer ";
-  if (!auth.startsWith(prefix)) {
+  const m = auth.match(/^Bearer\s+(.*)$/i);
+  if (!m) {
     return res.status(401).json({ error: "Unauthorized: missing or invalid token" });
   }
-  const token = auth.slice(prefix.length).trim();
+  const token = String(m[1] || "").trim();
+  if (!token) {
+    return res.status(401).json({ error: "Unauthorized: empty token" });
+  }
   const body = req.body || {};
-  snapshots.set(token, { ...body, updatedAt: new Date().toISOString() });
-  res.json({ ok: true });
+  const nowISO = new Date().toISOString();
+  const record = { ...body, updatedAt: nowISO };
+  snapshots.set(token, record);
+  res.set("Cache-Control", "no-store");
+  res.json({ ok: true, updatedAt: nowISO });
 });
 
+// GET snapshot JSON by path parameter
 app.get("/api/snapshot/:token", (req, res) => {
-  const token = req.params.token;
-  if (!snapshots.has(token)) {
+  const token = String(req.params.token || "").trim();
+  const rec = snapshots.get(token);
+  if (!rec) {
     return res.status(404).json({ error: "Snapshot not found" });
   }
-  res.json(snapshots.get(token));
+  res.set("Cache-Control", "no-store");
+  res.json(rec);
 });
 
+// GET snapshot JSON by query parameter (?token=...)
+app.get("/api/snapshot", (req, res) => {
+  const token = String(req.query.token || "").trim();
+  const rec = snapshots.get(token);
+  if (!token || !rec) {
+    return res.status(404).json({ error: "Snapshot not found" });
+  }
+  res.set("Cache-Control", "no-store");
+  res.json(rec);
+});
+
+// Alias JSON endpoint for share (optional)
+app.get("/api/share/:token", (req, res) => {
+  const token = String(req.params.token || "").trim();
+  const rec = snapshots.get(token);
+  if (!rec) {
+    return res.status(404).json({ error: "Snapshot not found" });
+  }
+  res.set("Cache-Control", "no-store");
+  res.json(rec);
+});
+
+// API: list matches updated within TTL (default 24h)
+app.get("/api/list", (req, res) => {
+  const items = [];
+  for (const [token, rec] of snapshots.entries()) {
+    if (!isFresh(rec)) continue;
+    const status = rec.status || (rec.isEnded ? "final" : (rec.isPaused ? "paused" : "live"));
+    items.push({
+      token,
+      home: rec.home || "Koti",
+      away: rec.away || "Vieras",
+      scoreHome: rec.scoreHome ?? 0,
+      scoreAway: rec.scoreAway ?? 0,
+      status,
+      updatedAt: rec.updatedAt
+    });
+  }
+  items.sort((a, b) => Date.parse(b.updatedAt) - Date.parse(a.updatedAt));
+  res.set("Cache-Control", "no-store");
+  res.json({ ttlMs: TTL_MS, nowISO: new Date().toISOString(), items });
+});
+
+// Root -> redirect to /list for convenience
+app.get("/", (req, res) => {
+  res.redirect(302, "/list");
+});
+
+// Simple health endpoint (if you need one)
+app.get("/health", (req, res) => {
+  res.type("text/plain").send("OK");
+});
+
+// Share page with proper possession bar and 'Lopputulos' label
 app.get("/share/:token", (req, res) => {
-  const token = req.params.token;
-  if (!snapshots.has(token)) {
+  const token = String(req.params.token || "").trim();
+  const s = snapshots.get(token);
+  if (!s) {
     return res.status(404).send("Snapshot not found");
   }
-  const s = snapshots.get(token);
-
-  const homePossessionPercent = Math.max(0, Math.min(100, Number(s.possessionHomePct ?? 0)));
-  const awayPossessionPercent = 100 - homePossessionPercent;
+  const { h: homePossessionPercent, a: awayPossessionPercent } = pickPossession(s);
 
   const secs = Number(s.matchSeconds ?? 0);
-  const mm = String(Math.floor(secs / 60)).padStart(2, '0');
-  const ss = String(secs % 60).padStart(2, '0');
+  const mm = String(Math.floor(secs / 60)).padStart(2, "0");
+  const ss = String(secs % 60).padStart(2, "0");
   const clockStr = `${mm}:${ss}`;
 
+  const status = s.status || (s.isEnded ? "final" : (s.isPaused ? "paused" : "live"));
+  const statusText = s.statusTextFi || (status === "final" ? "Lopputulos" : "");
+
+  const homeHex = s.homeColorHex || "#FF3B30";
+  const awayHex = s.awayColorHex || "#0A84FF";
+
   const html = `<!DOCTYPE html>
-<html lang="en">
+<html lang="fi">
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>Quick Stats Share</title>
+<title>Liveseuranta</title>
 <style>
-  body {
-    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
-      Oxygen, Ubuntu, Cantarell, "Open Sans", "Helvetica Neue", sans-serif;
-    margin: 0;
-    background: #fff;
-    color: #222;
-  }
-  .container {
-    max-width: 600px;
-    margin: 16px auto;
-    border: 1px solid #ccc;
-    border-radius: 8px;
-    padding: 16px;
-  }
-  header {
-    text-align: center;
-    margin-bottom: 12px;
-  }
-  header h1 {
-    margin: 0;
-    font-size: 1.5rem;
-  }
-  header .date {
-    font-size: 0.9rem;
-    color: #666;
-    margin-top: 4px;
-  }
-  .teams {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    font-weight: 600;
-    font-size: 1.3rem;
-  }
-  .score {
-    font-size: 2rem;
-    font-weight: 700;
-  }
-  .final-label { margin-top: 4px; }
-  .clock {
-    text-align: center;
-    font-size: 1.1rem;
-    margin-top: 8px;
-    font-weight: 500;
-  }
-  .possession-bar {
-    margin: 20px 0;
-    height: 24px;
-    background: #ddd;
-    border-radius: 12px;
-    overflow: hidden;
-    display: flex;
-  }
-  .possession-home {
-    height: 100%;
-    background-color: ${s.homeColorHex};
-    width: ${homePossessionPercent}%;
-    transition: width 0.3s ease;
-  }
-  .possession-away {
-    height: 100%;
-    background-color: ${s.awayColorHex};
-    width: ${awayPossessionPercent}%;
-    transition: width 0.3s ease;
-  }
-  .stats-row {
-    display: flex;
-    justify-content: space-between;
-    font-weight: 600;
-    font-size: 1rem;
-    margin-top: 12px;
-  }
-  .stats-row .label {
-    flex: 1 1 33%;
-    text-align: center;
-    color: #444;
-  }
-  .stats-row .value {
-    flex: 1 1 33%;
-    text-align: center;
-  }
-  .stats-header {
-    display: flex;
-    justify-content: space-between;
-    margin-top: 24px;
-    font-weight: 600;
-    font-size: 1rem;
-  }
+  :root { --glass-bg: rgba(255,255,255,0.7); --glass-border: rgba(0,0,0,0.08); --text:#111; --subtle:#666; }
+  * { box-sizing: border-box; }
+  body { margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; background: linear-gradient(180deg, #f7f8fa, #eef3f7); color: var(--text); }
+  .container { max-width: 860px; margin: 16px auto; padding: 16px; background: var(--glass-bg); border: 1px solid var(--glass-border); border-radius: 16px; box-shadow: 0 6px 20px rgba(0,0,0,0.06); }
+  header { text-align: center; margin-bottom: 10px; }
+  header .line { font-size: 24px; font-weight: 700; }
+  header .status { margin-top: 4px; font-size: 13px; color: var(--subtle); min-height: 18px; }
+  header .meta { margin-top: 6px; font-size: 12px; color: var(--subtle); }
+  .possession { margin: 16px 0 8px; }
+  .possession .bar { position: relative; height: 12px; background: rgba(0,0,0,0.1); border-radius: 999px; overflow: hidden; }
+  .possession .fill { position: absolute; left: 0; top: 0; bottom: 0; width: ${homePossessionPercent}%; background: ${homeHex}CC; border-radius: 999px; transition: width 0.3s ease; }
+  .possession .legend { display: flex; justify-content: space-between; font-size: 12px; margin-top: 6px; }
+  .stats-grid { display: flex; gap: 24px; margin-top: 14px; }
+  .side { flex: 1 1 0; }
+  .side h3 { margin: 0 0 6px; font-size: 15px; font-weight: 700; }
+  .item { display: flex; align-items: center; gap: 6px; font-size: 13px; color: #222; }
+  .item .val { margin-left: auto; font-weight: 600; }
 </style>
 </head>
 <body>
   <div class="container" role="main" aria-label="Match Quick Stats">
     <header>
-      <h1>${s.home} vs ${s.away}</h1>
-      <div class="date">${new Date(s.dateISO).toLocaleString(undefined, {
-        dateStyle: "medium",
-        timeStyle: "short",
-      })}</div>
+      <div class="line">${s.home ?? "Koti"} ${s.scoreHome ?? 0} – ${s.scoreAway ?? 0} ${s.away ?? "Vieras"}</div>
+      <div class="status">${statusText}</div>
+      <div class="meta">${status === "final" ? "" : \`\${s.half ?? 1}. puoliaika • ${clockStr}\`}</div>
     </header>
 
-    <div class="teams" aria-label="Teams and score">
-      <div class="team home" style="color: ${s.homeColorHex}">${s.home}</div>
-      <div class="score" aria-live="polite">${s.scoreHome} - ${s.scoreAway}</div>
-      ${s.isEnded ? '<div class="final-label" style="text-align:center;color:#666;font-size:0.9rem;">Final</div>' : ''}
-      <div class="team away" style="color: ${s.awayColorHex}">${s.away}</div>
-    </div>
-    <div class="clock" aria-live="polite" aria-atomic="true">${clockStr}</div>
+    <section class="possession" aria-label="Pallonhallinta">
+      <div class="bar" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${homePossessionPercent}">
+        <div class="fill" id="posFill"></div>
+      </div>
+      <div class="legend"><span id="posHome">${s.home ?? "Koti"} ${homePossessionPercent}%</span><span id="posAway">${s.away ?? "Vieras"} ${awayPossessionPercent}%</span></div>
+    </section>
 
-    <div class="possession-bar" aria-label="Possession bar">
-      <div
-        class="possession-home"
-        style="width:${homePossessionPercent}%;background-color:${s.homeColorHex}"
-        aria-valuenow="${homePossessionPercent.toFixed(
-          0
-        )}" aria-valuemin="0" aria-valuemax="100" role="progressbar"
-        aria-label="Home possession"
-      ></div>
-      <div
-        class="possession-away"
-        style="width:${awayPossessionPercent}%;background-color:${s.awayColorHex}"
-        aria-label="Away possession"
-      ></div>
-    </div>
-
-    <div class="stats-header" role="row">
-      <div class="label" role="columnheader" aria-colindex="1">Statistic</div>
-      <div class="label" role="columnheader" aria-colindex="2">${s.home}</div>
-      <div class="label" role="columnheader" aria-colindex="3">${s.away}</div>
-    </div>
-
-    <div class="stats-row" role="row">
-      <div class="label" role="cell">xG</div>
-      <div class="value" role="cell">${s.homeXG.toFixed(2)}</div>
-      <div class="value" role="cell">${s.awayXG.toFixed(2)}</div>
-    </div>
-
-    <div class="stats-row" role="row">
-      <div class="label" role="cell">Shots</div>
-      <div class="value" role="cell">${s.homeShots}</div>
-      <div class="value" role="cell">${s.awayShots}</div>
-    </div>
-
-    <div class="stats-row" role="row">
-      <div class="label" role="cell">Corners</div>
-      <div class="value" role="cell">${s.homeCorners}</div>
-      <div class="value" role="cell">${s.awayCorners}</div>
-    </div>
+    <section class="stats-grid">
+      <div class="side" style="color:${homeHex}">
+        <h3>${s.home ?? "Koti"}</h3>
+        <div class="item">🎯 xG <span class="val" id="homeXG">${Number(s.homeXG || 0).toFixed(2)}</span></div>
+        <div class="item">⚽️ Laukaukset <span class="val" id="homeShots">${s.homeShots ?? 0}</span></div>
+        <div class="item">🚩 Kulmapotkut <span class="val" id="homeCorners">${s.homeCorners ?? 0}</span></div>
+      </div>
+      <div class="side" style="text-align:right; color:${awayHex}">
+        <h3>${s.away ?? "Vieras"}</h3>
+        <div class="item">🎯 xG <span class="val" id="awayXG">${Number(s.awayXG || 0).toFixed(2)}</span></div>
+        <div class="item">⚽️ Laukaukset <span class="val" id="awayShots">${s.awayShots ?? 0}</span></div>
+        <div class="item">🚩 Kulmapotkut <span class="val" id="awayCorners">${s.awayCorners ?? 0}</span></div>
+      </div>
+    </section>
   </div>
 
   <script>
-    // Poll every 2 seconds to update stats
-    function mmss(total) {
-      total = Math.max(0, total|0);
-      const m = String(Math.floor(total / 60)).padStart(2, '0');
-      const s = String(total % 60).padStart(2, '0');
-      return m + ':' + s;
+    function pad(n){ return String(n).padStart(2,'0'); }
+    function mmss(sec){ sec = Math.max(0, sec|0); const m = Math.floor(sec/60), s = sec%60; return \`\${pad(m)}:\${pad(s)}\`; }
+    function pickPct(obj){
+      if (typeof obj.possessionHomePct === 'number' && typeof obj.possessionAwayPct === 'number') return { home: obj.possessionHomePct, away: obj.possessionAwayPct };
+      if (obj.possession && typeof obj.possession.homePct === 'number' && typeof obj.possession.awayPct === 'number') return { home: obj.possession.homePct, away: obj.possession.awayPct };
+      if (typeof obj.possessionHome === 'number' && typeof obj.possessionAway === 'number') return { home: obj.possessionHome, away: obj.possessionAway };
+      return { home: 0, away: 0 };
     }
+
     const token = ${JSON.stringify(token)};
-    async function fetchStats() {
+    async function refresh() {
       try {
-        const res = await fetch('/api/snapshot/' + token);
+        const res = await fetch('/api/snapshot/' + encodeURIComponent(token));
         if (!res.ok) return;
         const data = await res.json();
-        // Update DOM with any changed values
 
-        document.querySelector('header h1').textContent = data.home + ' vs ' + data.away;
-        document.querySelector('header .date').textContent = new Date(data.dateISO).toLocaleString(undefined, {dateStyle:'medium',timeStyle:'short'});
-        document.querySelector('.teams .team.home').textContent = data.home;
-        document.querySelector('.teams .team.home').style.color = data.homeColorHex;
-        document.querySelector('.teams .team.away').textContent = data.away;
-        document.querySelector('.teams .team.away').style.color = data.awayColorHex;
-        document.querySelector('.score').textContent = (data.scoreHome ?? 0) + ' - ' + (data.scoreAway ?? 0);
-        document.querySelector('.clock').textContent = mmss(data.matchSeconds ?? 0);
+        // Scoreline & status
+        document.querySelector('header .line').textContent = \`\${data.home ?? 'Koti'} \${data.scoreHome ?? 0} – \${data.scoreAway ?? 0} \${data.away ?? 'Vieras'}\`;
+        const status = data.status || (data.isEnded ? 'final' : (data.isPaused ? 'paused' : 'live'));
+        const statusText = data.statusTextFi || (status === 'final' ? 'Lopputulos' : '');
+        document.querySelector('header .status').textContent = statusText || '';
+        document.querySelector('header .meta').textContent = (status === 'final') ? '' : \`\${data.half ?? 1}. puoliaika • \${mmss(data.matchSeconds ?? 0)}\`;
 
-        // Possession calculation
-        let homePossessionPercent = 50;
-        if ((data.homeXG ?? 0) + (data.awayXG ?? 0) > 0) {
-          homePossessionPercent = ((data.homeXG ?? 0) / ((data.homeXG ?? 0) + (data.awayXG ?? 0))) * 100;
-        } else if ((data.homeShots ?? 0) + (data.awayShots ?? 0) > 0) {
-          homePossessionPercent = ((data.homeShots ?? 0) / ((data.homeShots ?? 0) + (data.awayShots ?? 0))) * 100;
-        }
-        const awayPossessionPercent = 100 - homePossessionPercent;
+        // Possession (always from data)
+        const pct = pickPct(data);
+        const homePct = Math.max(0, Math.min(100, pct.home|0));
+        const awayPct = Math.max(0, Math.min(100, pct.away|0));
+        const fill = document.getElementById('posFill');
+        fill.style.width = homePct + '%';
+        fill.style.background = (data.homeColorHex || '#0A84FF') + 'CC';
+        document.getElementById('posHome').textContent = \`\${data.home ?? 'Koti'} \${homePct}%\`;
+        document.getElementById('posAway').textContent = \`\${data.away ?? 'Vieras'} \${awayPct}%\`;
 
-        const possessionHomeEl = document.querySelector('.possession-home');
-        const possessionAwayEl = document.querySelector('.possession-away');
-        possessionHomeEl.style.width = homePossessionPercent + '%';
-        possessionHomeEl.style.backgroundColor = data.homeColorHex;
-        possessionHomeEl.setAttribute('aria-valuenow', homePossessionPercent.toFixed(0));
-        possessionAwayEl.style.width = awayPossessionPercent + '%';
-        possessionAwayEl.style.backgroundColor = data.awayColorHex;
-
-        // Stats update
-        const stats = [
-          { label: 'xG', home: data.homeXG.toFixed(2), away: data.awayXG.toFixed(2) },
-          { label: 'Shots', home: data.homeShots, away: data.awayShots },
-          { label: 'Corners', home: data.homeCorners, away: data.awayCorners },
-        ];
-
-        const rows = document.querySelectorAll('.stats-row');
-        stats.forEach((stat, i) => {
-          rows[i].children[0].textContent = stat.label;
-          rows[i].children[1].textContent = stat.home;
-          rows[i].children[2].textContent = stat.away;
-        });
-
+        // Quick stats
+        document.getElementById('homeXG').textContent = (Number(data.homeXG || 0)).toFixed(2);
+        document.getElementById('awayXG').textContent = (Number(data.awayXG || 0)).toFixed(2);
+        document.getElementById('homeShots').textContent = String(data.homeShots ?? '0');
+        document.getElementById('awayShots').textContent = String(data.awayShots ?? '0');
+        document.getElementById('homeCorners').textContent = String(data.homeCorners ?? '0');
+        document.getElementById('awayCorners').textContent = String(data.awayCorners ?? '0');
       } catch (e) {
-        // fail silently
+        // ignore
       }
     }
-    setInterval(fetchStats, 2000);
+    refresh();
+    setInterval(refresh, 2000);
   </script>
 </body>
 </html>`;
-
-  res.setHeader("Content-Type", "text/html");
+  res.setHeader("Content-Type", "text/html; charset=utf-8");
+  res.setHeader("Cache-Control", "no-store");
   res.send(html);
 });
 
-// Render deploy expects port from env or default 10000
+// List page: shows matches updated within TTL (default 24h)
+app.get("/list", (req, res) => {
+  const items = [];
+  for (const [token, rec] of snapshots.entries()) {
+    if (!isFresh(rec)) continue;
+    const status = rec.status || (rec.isEnded ? "final" : (rec.isPaused ? "paused" : "live"));
+    items.push({
+      token,
+      home: rec.home || "Koti",
+      away: rec.away || "Vieras",
+      scoreHome: rec.scoreHome ?? 0,
+      scoreAway: rec.scoreAway ?? 0,
+      status,
+      updatedAt: rec.updatedAt
+    });
+  }
+  items.sort((a, b) => Date.parse(b.updatedAt) - Date.parse(a.updatedAt));
+
+  const html = `<!doctype html>
+<html lang="fi">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Liveseuranta – Ottelulista</title>
+  <meta http-equiv="refresh" content="15" />
+  <style>
+    body { margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; background: #f7f8fa; color: #111; }
+    .wrap { max-width: 900px; margin: 20px auto; padding: 0 16px; }
+    h1 { font-size: 22px; margin: 6px 0 12px; }
+    .hint { color: #666; font-size: 13px; margin-bottom: 12px; }
+    table { width: 100%; border-collapse: collapse; background: rgba(255,255,255,0.9); border: 1px solid rgba(0,0,0,0.08); border-radius: 12px; overflow: hidden; }
+    th, td { padding: 10px 12px; border-bottom: 1px solid rgba(0,0,0,0.06); font-size: 14px; }
+    th { background: rgba(0,0,0,0.04); text-align: left; }
+    tr:last-child td { border-bottom: none; }
+    .status { font-size: 12px; color: #666; }
+    .links a { margin-right: 8px; font-size: 13px; }
+    .empty { padding: 12px 0; color: #666; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>Liveseuranta – ottelut (${items.length})</h1>
+    <div class="hint">Näytetään ottelut, joita on päivitetty viimeisen ${TTL_HOURS} tunnin aikana.</div>
+    ${
+      items.length === 0
+      ? '<div class="empty">Ei aktiivisia otteluita. Päivitä sivu hetken päästä tai aloita uusi liveseuranta sovelluksesta.</div>'
+      : `<table>
+          <thead>
+            <tr>
+              <th>Ottelu</th>
+              <th>Tulos</th>
+              <th>Status</th>
+              <th>Päivitetty</th>
+              <th>Linkit</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${items.map(i => {
+              const d = new Date(i.updatedAt);
+              const dateStr = d.toLocaleString('fi-FI', { dateStyle: 'short', timeStyle: 'medium' });
+              const score = `${i.scoreHome} – ${i.scoreAway}`;
+              const statusFi = i.status === 'final' ? 'Lopputulos' : (i.status === 'paused' ? 'Tauko' : 'Käynnissä');
+              const tok = encodeURIComponent(i.token);
+              return `<tr>
+                <td>${i.home} – ${i.away}</td>
+                <td>${score}</td>
+                <td class="status">${statusFi}</td>
+                <td class="status">${dateStr}</td>
+                <td class="links">
+                  <a href="/share/${tok}">Share-sivu</a>
+                  <a href="/api/snapshot/${tok}">JSON</a>
+                </td>
+              </tr>`;
+            }).join('')}
+          </tbody>
+        </table>`
+    }
+  </div>
+</body>
+</html>`;
+  res.setHeader("Content-Type", "text/html; charset=utf-8");
+  res.setHeader("Cache-Control", "no-store");
+  res.send(html);
+});
+
+// Optional: serve static assets if you add a /public folder later
+app.use(express.static(path.join(__dirname, "public")));
+
+// Port (Render.com usually provides PORT)
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
   console.log(`Server listening on port ${PORT}`);
