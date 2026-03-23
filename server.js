@@ -9,12 +9,50 @@ const path = require('path');
 const app = express();
 app.use(express.json({ limit: '1mb' }));
 
-// In-memory snapshot store: token -> snapshot (last one wins)
-const snapshots = new Map();
+// In-memory match store: matchId -> snapshot (last one wins per match)
+const matches = new Map();
 
 // Retention: keep matches visible for last N hours (default 24h)
 const TTL_HOURS = Number(process.env.LIVE_TTL_HOURS || 24);
 const TTL_MS = Number(process.env.LIVE_TTL_MS || TTL_HOURS * 60 * 60 * 1000);
+
+function slugify(str = '') {
+  return String(str)
+    .trim()
+    .toLowerCase()
+    .normalize('NFKD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '');
+}
+
+function extractMatchDate(obj = {}) {
+  const raw =
+    obj.matchDate ||
+    obj.date ||
+    obj.kickoffDate ||
+    obj.kickoff ||
+    obj.startTime ||
+    obj.startDate ||
+    obj.gameDate ||
+    obj.matchStart ||
+    obj.updatedAt ||
+    new Date().toISOString();
+
+  const d = new Date(raw);
+  if (Number.isNaN(d.getTime())) {
+    return new Date().toISOString().slice(0, 10);
+  }
+
+  return d.toISOString().slice(0, 10); // YYYY-MM-DD
+}
+
+function buildMatchId(obj = {}) {
+  const date = extractMatchDate(obj);
+  const home = slugify(obj.home || obj.homeTeam || 'koti');
+  const away = slugify(obj.away || obj.awayTeam || 'vieras');
+  return `${date}_${home}_${away}`;
+}
 
 // Helper: possession picker (supports old/new keys)
 function pickPossession(obj = {}) {
@@ -62,16 +100,43 @@ function isFresh(rec) {
   return Date.now() - t < TTL_MS;
 }
 
+function getStatus(rec = {}) {
+  return rec.status || (rec.isEnded ? 'final' : (rec.isPaused ? 'paused' : 'live'));
+}
+
+function listFreshMatches() {
+  const items = [];
+
+  for (const [matchId, rec] of matches.entries()) {
+    if (!isFresh(rec)) continue;
+
+    items.push({
+      matchId,
+      home: rec.home || rec.homeTeam || 'Koti',
+      away: rec.away || rec.awayTeam || 'Vieras',
+      scoreHome: rec.scoreHome ?? 0,
+      scoreAway: rec.scoreAway ?? 0,
+      status: getStatus(rec),
+      updatedAt: rec.updatedAt,
+      matchDate: rec.matchDate || extractMatchDate(rec)
+    });
+  }
+
+  items.sort((a, b) => Date.parse(b.updatedAt) - Date.parse(a.updatedAt));
+  return items;
+}
+
 // Periodic cleanup to avoid unbounded growth
 setInterval(() => {
-  for (const [token, rec] of snapshots.entries()) {
+  for (const [matchId, rec] of matches.entries()) {
     if (!isFresh(rec)) {
-      snapshots.delete(token);
+      matches.delete(matchId);
     }
   }
-}, 15 * 60 * 1000); // every 15 minutes
+}, 15 * 60 * 1000);
 
 // POST snapshot from the app (Bearer <token>)
+// matchId is generated on the server from date + home + away
 app.post('/api/snapshot', (req, res) => {
   const auth = req.headers.authorization || '';
   const m = auth.match(/^Bearer\s+(.*)$/i);
@@ -81,25 +146,46 @@ app.post('/api/snapshot', (req, res) => {
   }
 
   const token = String(m[1] || '').trim();
-
   if (!token) {
     return res.status(401).json({ error: 'Unauthorized: empty token' });
   }
 
   const body = req.body || {};
-  const nowISO = new Date().toISOString();
-  const record = { ...body, updatedAt: nowISO };
+  const home = String(body.home || body.homeTeam || '').trim();
+  const away = String(body.away || body.awayTeam || '').trim();
 
-  snapshots.set(token, record);
+  if (!home || !away) {
+    return res.status(400).json({
+      error: 'Missing team names: home and away are required to build matchId'
+    });
+  }
+
+  const matchDate = extractMatchDate(body);
+  const matchId = buildMatchId({ ...body, home, away, matchDate });
+  const nowISO = new Date().toISOString();
+
+  const prev = matches.get(matchId) || {};
+  const record = {
+    ...prev,
+    ...body,
+    home,
+    away,
+    token,
+    matchId,
+    matchDate,
+    updatedAt: nowISO
+  };
+
+  matches.set(matchId, record);
 
   res.set('Cache-Control', 'no-store');
-  res.json({ ok: true, updatedAt: nowISO });
+  res.json({ ok: true, matchId, updatedAt: nowISO });
 });
 
-// GET snapshot JSON by path parameter
-app.get('/api/snapshot/:token', (req, res) => {
-  const token = String(req.params.token || '').trim();
-  const rec = snapshots.get(token);
+// GET snapshot JSON by matchId path parameter
+app.get('/api/snapshot/:matchId', (req, res) => {
+  const matchId = String(req.params.matchId || '').trim();
+  const rec = matches.get(matchId);
 
   if (!rec) {
     return res.status(404).json({ error: 'Snapshot not found' });
@@ -109,12 +195,12 @@ app.get('/api/snapshot/:token', (req, res) => {
   res.json(rec);
 });
 
-// GET snapshot JSON by query parameter (?token=...)
+// GET snapshot JSON by query parameter (?matchId=...)
 app.get('/api/snapshot', (req, res) => {
-  const token = String(req.query.token || '').trim();
-  const rec = snapshots.get(token);
+  const matchId = String(req.query.matchId || '').trim();
+  const rec = matches.get(matchId);
 
-  if (!token || !rec) {
+  if (!matchId || !rec) {
     return res.status(404).json({ error: 'Snapshot not found' });
   }
 
@@ -123,9 +209,9 @@ app.get('/api/snapshot', (req, res) => {
 });
 
 // Alias JSON endpoint for share (optional)
-app.get('/api/share/:token', (req, res) => {
-  const token = String(req.params.token || '').trim();
-  const rec = snapshots.get(token);
+app.get('/api/share/:matchId', (req, res) => {
+  const matchId = String(req.params.matchId || '').trim();
+  const rec = matches.get(matchId);
 
   if (!rec) {
     return res.status(404).json({ error: 'Snapshot not found' });
@@ -137,26 +223,7 @@ app.get('/api/share/:token', (req, res) => {
 
 // API: list matches updated within TTL (default 24h)
 app.get('/api/list', (req, res) => {
-  const items = [];
-
-  for (const [token, rec] of snapshots.entries()) {
-    if (!isFresh(rec)) continue;
-
-    const status = rec.status || (rec.isEnded ? 'final' : rec.isPaused ? 'paused' : 'live');
-
-    items.push({
-      token,
-      home: rec.home || 'Koti',
-      away: rec.away || 'Vieras',
-      scoreHome: rec.scoreHome ?? 0,
-      scoreAway: rec.scoreAway ?? 0,
-      status,
-      updatedAt: rec.updatedAt
-    });
-  }
-
-  items.sort((a, b) => Date.parse(b.updatedAt) - Date.parse(a.updatedAt));
-
+  const items = listFreshMatches();
   res.set('Cache-Control', 'no-store');
   res.json({ ttlMs: TTL_MS, nowISO: new Date().toISOString(), items });
 });
@@ -172,9 +239,9 @@ app.get('/health', (req, res) => {
 });
 
 // Share page with proper possession bar and 'Lopputulos' label
-app.get('/share/:token', (req, res) => {
-  const token = String(req.params.token || '').trim();
-  const s = snapshots.get(token);
+app.get('/share/:matchId', (req, res) => {
+  const matchId = String(req.params.matchId || '').trim();
+  const s = matches.get(matchId);
 
   if (!s) {
     return res.status(404).send('Snapshot not found');
@@ -187,7 +254,7 @@ app.get('/share/:token', (req, res) => {
   const ss = String(secs % 60).padStart(2, '0');
   const clockStr = `${mm}:${ss}`;
 
-  const status = s.status || (s.isEnded ? 'final' : s.isPaused ? 'paused' : 'live');
+  const status = getStatus(s);
   const statusText = s.statusTextFi || (status === 'final' ? 'Lopputulos' : '');
 
   const homeHex = s.homeColorHex || '#FF3B30';
@@ -280,30 +347,28 @@ app.get('/share/:token', (req, res) => {
       return { home: 0, away: 0 };
     }
 
-    const token = ${JSON.stringify(token)};
+    const matchId = ${JSON.stringify(matchId)};
 
     async function refresh() {
       try {
-        const res = await fetch('/api/snapshot/' + encodeURIComponent(token));
+        const res = await fetch('/api/snapshot/' + encodeURIComponent(matchId));
         if (!res.ok) return;
 
         const data = await res.json();
 
-        // Scoreline & status
         document.querySelector('header .line').textContent =
           (data.home ?? 'Koti') + ' ' +
           (data.scoreHome ?? 0) + ' – ' +
           (data.scoreAway ?? 0) + ' ' +
           (data.away ?? 'Vieras');
 
-        const status = data.status || (data.isEnded ? 'final' : data.isPaused ? 'paused' : 'live');
+        const status = data.status || (data.isEnded ? 'final' : (data.isPaused ? 'paused' : 'live'));
         const statusText = data.statusTextFi || (status === 'final' ? 'Lopputulos' : '');
 
         document.querySelector('header .status').textContent = statusText || '';
         document.querySelector('header .meta').textContent =
           status === 'final' ? '' : ((data.half ?? 1) + '. puoliaika • ' + mmss(data.matchSeconds ?? 0));
 
-        // Possession
         const pct = pickPct(data);
         const homePct = Math.max(0, Math.min(100, pct.home | 0));
         const awayPct = Math.max(0, Math.min(100, pct.away | 0));
@@ -315,7 +380,6 @@ app.get('/share/:token', (req, res) => {
         document.getElementById('posHome').textContent = (data.home ?? 'Koti') + ' ' + homePct + '%';
         document.getElementById('posAway').textContent = (data.away ?? 'Vieras') + ' ' + awayPct + '%';
 
-        // Quick stats
         document.getElementById('homeXG').textContent = Number(data.homeXG || 0).toFixed(2);
         document.getElementById('awayXG').textContent = Number(data.awayXG || 0).toFixed(2);
         document.getElementById('homeShots').textContent = String(data.homeShots ?? '0');
@@ -340,25 +404,7 @@ app.get('/share/:token', (req, res) => {
 
 // List page: shows matches updated within TTL (default 24h)
 app.get('/list', (req, res) => {
-  const items = [];
-
-  for (const [token, rec] of snapshots.entries()) {
-    if (!isFresh(rec)) continue;
-
-    const status = rec.status || (rec.isEnded ? 'final' : rec.isPaused ? 'paused' : 'live');
-
-    items.push({
-      token,
-      home: rec.home || 'Koti',
-      away: rec.away || 'Vieras',
-      scoreHome: rec.scoreHome ?? 0,
-      scoreAway: rec.scoreAway ?? 0,
-      status,
-      updatedAt: rec.updatedAt
-    });
-  }
-
-  items.sort((a, b) => Date.parse(b.updatedAt) - Date.parse(a.updatedAt));
+  const items = listFreshMatches();
 
   const html = `<!doctype html>
 <html lang="fi">
@@ -369,16 +415,17 @@ app.get('/list', (req, res) => {
   <meta http-equiv="refresh" content="15" />
   <style>
     body { margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; background: #f7f8fa; color: #111; }
-    .wrap { max-width: 900px; margin: 20px auto; padding: 0 16px; }
+    .wrap { max-width: 980px; margin: 20px auto; padding: 0 16px; }
     h1 { font-size: 22px; margin: 6px 0 12px; }
     .hint { color: #666; font-size: 13px; margin-bottom: 12px; }
     table { width: 100%; border-collapse: collapse; background: rgba(255,255,255,0.9); border: 1px solid rgba(0,0,0,0.08); border-radius: 12px; overflow: hidden; }
-    th, td { padding: 10px 12px; border-bottom: 1px solid rgba(0,0,0,0.06); font-size: 14px; }
+    th, td { padding: 10px 12px; border-bottom: 1px solid rgba(0,0,0,0.06); font-size: 14px; vertical-align: top; }
     th { background: rgba(0,0,0,0.04); text-align: left; }
     tr:last-child td { border-bottom: none; }
     .status { font-size: 12px; color: #666; }
     .links a { margin-right: 8px; font-size: 13px; }
     .empty { padding: 12px 0; color: #666; }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; color: #666; }
   </style>
 </head>
 <body>
@@ -394,6 +441,7 @@ app.get('/list', (req, res) => {
                 <th>Ottelu</th>
                 <th>Tulos</th>
                 <th>Status</th>
+                <th>Ottelupäivä</th>
                 <th>Päivitetty</th>
                 <th>Linkit</th>
               </tr>
@@ -404,16 +452,20 @@ app.get('/list', (req, res) => {
                 const dateStr = d.toLocaleString('fi-FI', { dateStyle: 'short', timeStyle: 'medium' });
                 const score = `${i.scoreHome} – ${i.scoreAway}`;
                 const statusFi = i.status === 'final' ? 'Lopputulos' : (i.status === 'paused' ? 'Tauko' : 'Käynnissä');
-                const tok = encodeURIComponent(i.token);
+                const mid = encodeURIComponent(i.matchId);
 
                 return `<tr>
-                  <td>${i.home} – ${i.away}</td>
+                  <td>
+                    <div>${i.home} – ${i.away}</div>
+                    <div class="mono">${i.matchId}</div>
+                  </td>
                   <td>${score}</td>
                   <td class="status">${statusFi}</td>
+                  <td class="status">${i.matchDate}</td>
                   <td class="status">${dateStr}</td>
                   <td class="links">
-                    <a href="/share/${tok}">Share-sivu</a>
-                    <a href="/api/snapshot/${tok}">JSON</a>
+                    <a href="/share/${mid}">Share-sivu</a>
+                    <a href="/api/snapshot/${mid}">JSON</a>
                   </td>
                 </tr>`;
               }).join('')}
