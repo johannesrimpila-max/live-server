@@ -26,7 +26,7 @@ function slugify(str = '') {
     .replace(/^-+|-+$/g, '');
 }
 
-// Match ID is based only on home + away teams
+// Fallback Match ID (käytetään vain jos client ei toimita MatchID:tä)
 function buildMatchId(obj = {}) {
   const home = slugify(obj.home || obj.homeTeam || 'koti');
   const away = slugify(obj.away || obj.awayTeam || 'vieras');
@@ -379,7 +379,12 @@ app.post('/api/snapshot', (req, res) => {
     });
   }
 
-  const matchId = buildMatchId({ ...body, home, away });
+  // Prefer client-provided MatchID (header or body), fallback to slug
+  const headerMatchId = String(req.headers['x-match-id'] || req.headers['x-matchid'] || '').trim();
+  const bodyMatchId = String(body.matchID || body.matchId || '').trim();
+  const providedMatchId = headerMatchId || bodyMatchId;
+
+  const matchId = providedMatchId || buildMatchId({ ...body, home, away });
   const nowISO = new Date().toISOString();
 
   const prev = matches.get(matchId) || {};
@@ -407,7 +412,9 @@ app.post('/api/snapshot', (req, res) => {
     token,
     home,
     away,
-    matchId
+    matchId,
+    providedMatchId,
+    headerMatchId
   });
 
   res.set('Cache-Control', 'no-store');
