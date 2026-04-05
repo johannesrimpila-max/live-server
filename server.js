@@ -396,7 +396,6 @@ function renderSharePage(res, s, originalId) {
   const secs = Number(s.matchSeconds ?? 0);
   const mm = String(Math.floor(secs / 60)).padStart(2, '0');
   const ss = String(secs % 60).padStart(2, '0');
-  const clockStr = mm + ':' + ss;
 
   const homeHex = s.homeColorHex || '#FF3B30';
   const awayHex = s.awayColorHex || '#0A84FF';
@@ -420,6 +419,8 @@ function renderSharePage(res, s, originalId) {
   .lang-switch { display: inline-flex; gap: 8px; }
   .lang-btn { border: 1px solid rgba(0,0,0,0.12); background: #fff; border-radius: 10px; padding: 8px 10px; cursor: pointer; font-size: 13px; }
   .lang-btn.active { background: #111; color: #fff; }
+  .back-row { margin-bottom: 12px; }
+  .back-link { color: #0a58ca; text-decoration: none; font-size: 14px; }
   .container { max-width: 860px; padding: 16px; background: var(--glass-bg); border: 1px solid var(--glass-border); border-radius: 16px; box-shadow: 0 6px 20px rgba(0,0,0,0.06); }
   header { text-align: center; margin-bottom: 10px; }
   header .line { font-size: 24px; font-weight: 700; }
@@ -444,6 +445,9 @@ function renderSharePage(res, s, originalId) {
 <body>
   <div class="page">
     ${renderLangSwitcher()}
+    <div class="back-row">
+      <a href="/list" id="backToListLink" class="back-link">Takaisin ottelulistaan</a>
+    </div>
     <div class="container" role="main" aria-label="Match Quick Stats">
       <header>
         <div class="line" id="scoreLine">${escapeHtml(s.home ?? 'Koti')} ${escapeHtml(String(s.scoreHome ?? 0))} – ${escapeHtml(String(s.scoreAway ?? 0))} ${escapeHtml(s.away ?? 'Vieras')}</div>
@@ -471,7 +475,6 @@ function renderSharePage(res, s, originalId) {
         </div>
         <div class="side" style="text-align:right; color:${escapeHtml(awayHex)}">
           <h3 id="awayTitle">${escapeHtml(s.away ?? 'Vieras')}</h3>
-          <div class="item"><spanieras')}</h3>
           <div class="item"><span class="label">🎯 xG</span><span class="val" id="awayXG">${escapeHtml(Number(s.awayXG || 0).toFixed(2))}</span></div>
           <div class="item"><span class="label shots-label">⚽️ Laukaukset</span><span class="val" id="awayShots">${escapeHtml(String(s.awayShots ?? 0))}</span></div>
           <div class="item"><span class="label corners-label">🚩 Kulmapotkut</span><span class="val" id="awayCorners">${escapeHtml(String(s.awayCorners ?? 0))}</span></div>
@@ -540,6 +543,11 @@ function renderSharePage(res, s, originalId) {
       document.querySelectorAll('.corners-label').forEach(function (el) {
         el.textContent = '🚩 ' + dict.corners;
       });
+
+      const backLink = document.getElementById('backToListLink');
+      if (backLink) {
+        backLink.textContent = dict.backToList;
+      }
 
       const fill = document.getElementById('posFill');
       fill.style.width = homePct + '%';
