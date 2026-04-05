@@ -33,11 +33,8 @@ const I18N = {
     match: 'Ottelu',
     score: 'Tulos',
     status: 'Status',
-    updated: 'Päivitetty',
-    links: 'Linkit',
-    sharePage: 'Share-sivu',
-    tokenPage: 'Token-sivu',
-    json: 'JSON',
+    links: 'Linkki',
+    sharePage: 'Seurantasivulle',
     openMatch: 'Avaa ottelu',
     backToList: 'Takaisin ottelulistaan'
   },
@@ -57,11 +54,8 @@ const I18N = {
     match: 'Match',
     score: 'Score',
     status: 'Status',
-    updated: 'Updated',
-    links: 'Links',
-    sharePage: 'Share page',
-    tokenPage: 'Token page',
-    json: 'JSON',
+    links: 'Link',
+    sharePage: 'To tracking page',
     openMatch: 'Open match',
     backToList: 'Back to match list'
   },
@@ -81,11 +75,8 @@ const I18N = {
     match: 'Match',
     score: 'Resultat',
     status: 'Status',
-    updated: 'Uppdaterad',
-    links: 'Länkar',
-    sharePage: 'Delsida',
-    tokenPage: 'Tokensida',
-    json: 'JSON',
+    links: 'Länk',
+    sharePage: 'Till matchsidan',
     openMatch: 'Öppna match',
     backToList: 'Tillbaka till matchlistan'
   }
@@ -116,7 +107,7 @@ function slugify(str = '') {
 function buildMatchId(obj = {}) {
   const home = slugify(obj.home || obj.homeTeam || 'koti');
   const away = slugify(obj.away || obj.awayTeam || 'vieras');
-  return `${home}__${away}`;
+  return home + '__' + away;
 }
 
 function pickPossession(obj = {}) {
@@ -279,7 +270,7 @@ function renderSharedClientHelpers(extraScript = '') {
         // ignore
       }
       document.documentElement.lang = next;
-      document.querySelectorAll('.lang-btn').forEach((btn) => {
+      document.querySelectorAll('.lang-btn').forEach(function (btn) {
         btn.classList.toggle('active', btn.dataset.lang === next);
       });
       return next;
@@ -309,7 +300,7 @@ function renderSharedClientHelpers(extraScript = '') {
     }
 
     function wireLanguageButtons(applyPageLanguage) {
-      document.querySelectorAll('.lang-btn').forEach((btn) => {
+      document.querySelectorAll('.lang-btn').forEach(function (btn) {
         btn.addEventListener('click', function () {
           setCurrentLang(btn.dataset.lang);
           applyPageLanguage();
@@ -398,17 +389,20 @@ setInterval(() => {
 }, 15 * 60 * 1000);
 
 function renderSharePage(res, s, originalId) {
-  const { h: homePossessionPercent, a: awayPossessionPercent } = pickPossession(s);
+  const possession = pickPossession(s);
+  const homePossessionPercent = possession.h;
+  const awayPossessionPercent = possession.a;
 
   const secs = Number(s.matchSeconds ?? 0);
   const mm = String(Math.floor(secs / 60)).padStart(2, '0');
   const ss = String(secs % 60).padStart(2, '0');
-  const clockStr = `${mm}:${ss}`;
+  const clockStr = mm + ':' + ss;
 
-  const status = getStatus(s);
   const homeHex = s.homeColorHex || '#FF3B30';
   const awayHex = s.awayColorHex || '#0A84FF';
 
+  // if user opened /share/<token>, keep refreshing by token
+  // if user opened /share/<matchId>, refresh by matchId
   const refreshId = originalId || s.matchId;
 
   const html = `<!DOCTYPE html>
@@ -477,6 +471,7 @@ function renderSharePage(res, s, originalId) {
         </div>
         <div class="side" style="text-align:right; color:${escapeHtml(awayHex)}">
           <h3 id="awayTitle">${escapeHtml(s.away ?? 'Vieras')}</h3>
+          <div class="item"><spanieras')}</h3>
           <div class="item"><span class="label">🎯 xG</span><span class="val" id="awayXG">${escapeHtml(Number(s.awayXG || 0).toFixed(2))}</span></div>
           <div class="item"><span class="label shots-label">⚽️ Laukaukset</span><span class="val" id="awayShots">${escapeHtml(String(s.awayShots ?? 0))}</span></div>
           <div class="item"><span class="label corners-label">🚩 Kulmapotkut</span><span class="val" id="awayCorners">${escapeHtml(String(s.awayCorners ?? 0))}</span></div>
@@ -736,8 +731,8 @@ app.post('/api/snapshot', (req, res) => {
     ok: true,
     token,
     matchId,
-    shareUrl: `/share/${matchId}`,
-    tokenShareUrl: `/share/${token}`,
+    shareUrl: '/share/' + matchId,
+    tokenShareUrl: '/share/' + token,
     updatedAt: nowISO
   });
 });
@@ -897,15 +892,14 @@ app.get('/list', (req, res) => {
     th { background: rgba(0,0,0,0.04); text-align: left; }
     tr:last-child td { border-bottom: none; }
     .status { font-size: 12px; color: #666; }
-    .links a { margin-right: 8px; font-size: 13px; color: #0a58ca; text-decoration: none; }
+    .links a { font-size: 13px; color: #0a58ca; text-decoration: none; }
     .empty { padding: 16px; color: #666; background: rgba(255,255,255,0.9); border: 1px solid rgba(0,0,0,0.08); border-radius: 12px; }
-    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; color: #666; }
   </style>
 </head>
 <body>
   <div class="wrap">
     ${renderLangSwitcher()}
-    <h1 id="listTitle" data-count="${items.length}">Liveseuranta – ottelut (${items.length})</h1>
+    <h1 id="listTitle">Liveseuranta – ottelut (${items.length})</h1>
     <div class="hint" id="listHint">Näytetään ottelut, joita on päivitetty viimeisen ${TTL_DAYS} päivän aikana.</div>
     ${
       items.length === 0
@@ -916,30 +910,20 @@ app.get('/list', (req, res) => {
                 <th id="thMatch">Ottelu</th>
                 <th id="thScore">Tulos</th>
                 <th id="thStatus">Status</th>
-                <th id="thUpdated">Päivitetty</th>
-                <th id="thLinks">Linkit</th>
+                <th id="thLinks">Linkki</th>
               </tr>
             </thead>
             <tbody>
               ${items.map((i) => {
-                const d = new Date(i.updatedAt);
-                const dateStr = d.toLocaleString('fi-FI', { dateStyle: 'short', timeStyle: 'medium' });
-                const score = `${i.scoreHome} – ${i.scoreAway}`;
+                const score = String(i.scoreHome ?? 0) + ' – ' + String(i.scoreAway ?? 0);
                 const mid = encodeURIComponent(i.matchId);
-                const tok = encodeURIComponent(i.token || '');
 
                 return `<tr>
-                  <td>
-                    <div>${escapeHtml(i.home)} – ${escapeHtml(i.away)}</div>
-                    <div class="mono">${escapeHtml(i.matchId)}</div>
-                  </td>
+                  <td>${escapeHtml(i.home)} – ${escapeHtml(i.away)}</td>
                   <td>${escapeHtml(score)}</td>
                   <td class="status" data-status="${escapeHtml(i.status)}"></td>
-                  <td class="status">${escapeHtml(dateStr)}</td>
                   <td class="links">
-                    <a href="/share/${mid}" class="share-link">Share-sivu</a>
-                    ${i.token ? `<a href="/share/${tok}" class="token-link">Token-sivu</a>` : ''}
-                    <a href="/api/snapshot/${mid}" class="json-link">JSON</a>
+                    <a href="/share/${mid}" class="share-link">Seurantasivulle</a>
                   </td>
                 </tr>`;
               }).join('')}
@@ -967,13 +951,11 @@ app.get('/list', (req, res) => {
       const thMatch = document.getElementById('thMatch');
       const thScore = document.getElementById('thScore');
       const thStatus = document.getElementById('thStatus');
-      const thUpdated = document.getElementById('thUpdated');
       const thLinks = document.getElementById('thLinks');
 
       if (thMatch) thMatch.textContent = dict.match;
       if (thScore) thScore.textContent = dict.score;
       if (thStatus) thStatus.textContent = dict.status;
-      if (thUpdated) thUpdated.textContent = dict.updated;
       if (thLinks) thLinks.textContent = dict.links;
 
       document.querySelectorAll('[data-status]').forEach(function (el) {
@@ -982,14 +964,6 @@ app.get('/list', (req, res) => {
 
       document.querySelectorAll('.share-link').forEach(function (el) {
         el.textContent = dict.sharePage;
-      });
-
-      document.querySelectorAll('.token-link').forEach(function (el) {
-        el.textContent = dict.tokenPage;
-      });
-
-      document.querySelectorAll('.json-link').forEach(function (el) {
-        el.textContent = dict.json;
       });
     }
 
