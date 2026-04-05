@@ -12,9 +12,95 @@ const matches = new Map();
 // token -> Set of matchIds
 const tokenToMatchIds = new Map();
 
-// Keep matches visible for last N hours
-const TTL_HOURS = Number(process.env.LIVE_TTL_HOURS || 24);
-const TTL_MS = Number(process.env.LIVE_TTL_MS || TTL_HOURS * 60 * 60 * 1000);
+// Keep matches visible for last N days
+const TTL_DAYS = Number(process.env.LIVE_TTL_DAYS || 7);
+const TTL_MS = Number(process.env.LIVE_TTL_MS || TTL_DAYS * 24 * 60 * 60 * 1000);
+
+const I18N = {
+  fi: {
+    shareTitle: 'Liveseuranta',
+    listTitle: 'Liveseuranta – ottelut',
+    selectMatch: 'Valitse ottelu',
+    multiMatches: 'Tällä tokenilla on useita aktiivisia otteluita.',
+    noMatches: 'Otteluseurannassa ei ole käynnissä olevia otteluita.',
+    daysHint: 'Näytetään ottelut, joita on päivitetty viimeisen {days} päivän aikana.',
+    statusFinal: 'Lopputulos',
+    statusPaused: 'Tauko',
+    statusLive: 'Käynnissä',
+    possession: 'Pallonhallinta',
+    shots: 'Laukaukset',
+    corners: 'Kulmapotkut',
+    match: 'Ottelu',
+    score: 'Tulos',
+    status: 'Status',
+    updated: 'Päivitetty',
+    links: 'Linkit',
+    sharePage: 'Share-sivu',
+    tokenPage: 'Token-sivu',
+    json: 'JSON',
+    openMatch: 'Avaa ottelu',
+    backToList: 'Takaisin ottelulistaan'
+  },
+  en: {
+    shareTitle: 'Live match tracker',
+    listTitle: 'Live match tracker – matches',
+    selectMatch: 'Select match',
+    multiMatches: 'This token has multiple active matches.',
+    noMatches: 'There are no active matches in the match tracker.',
+    daysHint: 'Showing matches updated during the last {days} days.',
+    statusFinal: 'Final',
+    statusPaused: 'Half-time',
+    statusLive: 'Live',
+    possession: 'Possession',
+    shots: 'Shots',
+    corners: 'Corners',
+    match: 'Match',
+    score: 'Score',
+    status: 'Status',
+    updated: 'Updated',
+    links: 'Links',
+    sharePage: 'Share page',
+    tokenPage: 'Token page',
+    json: 'JSON',
+    openMatch: 'Open match',
+    backToList: 'Back to match list'
+  },
+  sv: {
+    shareTitle: 'Liveuppföljning',
+    listTitle: 'Liveuppföljning – matcher',
+    selectMatch: 'Välj match',
+    multiMatches: 'Den här tokenen har flera aktiva matcher.',
+    noMatches: 'Det finns inga pågående matcher i matchuppföljningen.',
+    daysHint: 'Visar matcher som har uppdaterats under de senaste {days} dagarna.',
+    statusFinal: 'Slutresultat',
+    statusPaused: 'Paus',
+    statusLive: 'Pågår',
+    possession: 'Bollinnehav',
+    shots: 'Skott',
+    corners: 'Hörnor',
+    match: 'Match',
+    score: 'Resultat',
+    status: 'Status',
+    updated: 'Uppdaterad',
+    links: 'Länkar',
+    sharePage: 'Delsida',
+    tokenPage: 'Tokensida',
+    json: 'JSON',
+    openMatch: 'Öppna match',
+    backToList: 'Tillbaka till matchlistan'
+  }
+};
+
+const I18N_JSON = JSON.stringify(I18N);
+
+function escapeHtml(value = '') {
+  return String(value)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
 
 function slugify(str = '') {
   return String(str)
@@ -155,6 +241,138 @@ function removeMatchFromToken(token, matchId) {
   }
 }
 
+function renderLangSwitcher() {
+  return `
+    <div class="topbar">
+      <div class="lang-switch" role="group" aria-label="Language">
+        <button type="button" class="lang-btn" data-lang="fi">FI</button>
+        <button type="button" class="lang-btn" data-lang="en">EN</button>
+        <button type="button" class="lang-btn" data-lang="sv">SV</button>
+      </div>
+    </div>
+  `;
+}
+
+function renderSharedClientHelpers(extraScript = '') {
+  return `<script>
+    const I18N = ${I18N_JSON};
+    const TTL_DAYS = ${JSON.stringify(TTL_DAYS)};
+    const DEFAULT_LANG = 'fi';
+
+    function getDictionary(lang) {
+      return I18N[lang] || I18N[DEFAULT_LANG];
+    }
+
+    function getCurrentLang() {
+      try {
+        return localStorage.getItem('live_lang') || DEFAULT_LANG;
+      } catch (e) {
+        return DEFAULT_LANG;
+      }
+    }
+
+    function setCurrentLang(lang) {
+      const next = I18N[lang] ? lang : DEFAULT_LANG;
+      try {
+        localStorage.setItem('live_lang', next);
+      } catch (e) {
+        // ignore
+      }
+      document.documentElement.lang = next;
+      document.querySelectorAll('.lang-btn').forEach((btn) => {
+        btn.classList.toggle('active', btn.dataset.lang === next);
+      });
+      return next;
+    }
+
+    function formatText(text, vars) {
+      return String(text).replace(/\\{(\\w+)\\}/g, function (_, key) {
+        return Object.prototype.hasOwnProperty.call(vars, key) ? String(vars[key]) : '';
+      });
+    }
+
+    function getStatusText(status, lang) {
+      const dict = getDictionary(lang);
+      if (status === 'final') return dict.statusFinal;
+      if (status === 'paused') return dict.statusPaused;
+      return dict.statusLive;
+    }
+
+    function getHalfText(half, lang) {
+      const n = Number(half || 1);
+      if (lang === 'fi') return n + '. puoliaika';
+      if (lang === 'sv') return n + '. halvlek';
+      if (n === 1) return '1st half';
+      if (n === 2) return '2nd half';
+      if (n === 3) return '3rd half';
+      return n + 'th half';
+    }
+
+    function wireLanguageButtons(applyPageLanguage) {
+      document.querySelectorAll('.lang-btn').forEach((btn) => {
+        btn.addEventListener('click', function () {
+          setCurrentLang(btn.dataset.lang);
+          applyPageLanguage();
+        });
+      });
+
+      setCurrentLang(getCurrentLang());
+      applyPageLanguage();
+    }
+
+    ${extraScript}
+  </script>`;
+}
+
+function renderNoMatchesPage(res) {
+  const html = `<!doctype html>
+<html lang="fi">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Liveseuranta</title>
+  <style>
+    body { margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; background: #f7f8fa; color: #111; }
+    .wrap { max-width: 820px; margin: 20px auto; padding: 0 16px; }
+    .topbar { display: flex; justify-content: flex-end; margin-bottom: 12px; }
+    .lang-switch { display: inline-flex; gap: 8px; }
+    .lang-btn { border: 1px solid rgba(0,0,0,0.12); background: #fff; border-radius: 10px; padding: 8px 10px; cursor: pointer; font-size: 13px; }
+    .lang-btn.active { background: #111; color: #fff; }
+    .card { background: rgba(255,255,255,0.9); border: 1px solid rgba(0,0,0,0.08); border-radius: 16px; padding: 24px; box-shadow: 0 6px 20px rgba(0,0,0,0.06); }
+    h1 { margin: 0 0 10px; font-size: 24px; }
+    p { margin: 0 0 14px; color: #666; }
+    a { color: #0a58ca; text-decoration: none; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    ${renderLangSwitcher()}
+    <div class="card">
+      <h1 id="pageTitle">Liveseuranta</h1>
+      <p id="emptyText">Otteluseurannassa ei ole käynnissä olevia otteluita.</p>
+      <a href="/list" id="backLink">Takaisin ottelulistaan</a>
+    </div>
+  </div>
+  ${renderSharedClientHelpers(`
+    function applyPageLanguage() {
+      const lang = getCurrentLang();
+      const dict = getDictionary(lang);
+      document.title = dict.shareTitle;
+      document.getElementById('pageTitle').textContent = dict.shareTitle;
+      document.getElementById('emptyText').textContent = dict.noMatches;
+      document.getElementById('backLink').textContent = dict.backToList;
+    }
+
+    wireLanguageButtons(applyPageLanguage);
+  `)}
+</body>
+</html>`;
+
+  res.setHeader('Content-Type', 'text/html; charset=utf-8');
+  res.setHeader('Cache-Control', 'no-store');
+  res.status(404).send(html);
+}
+
 // Cleanup old matches every 15 min
 setInterval(() => {
   for (const [matchId, rec] of matches.entries()) {
@@ -188,15 +406,9 @@ function renderSharePage(res, s, originalId) {
   const clockStr = `${mm}:${ss}`;
 
   const status = getStatus(s);
-  const statusText = s.statusTextFi || (status === 'final' ? 'Lopputulos' : '');
-
   const homeHex = s.homeColorHex || '#FF3B30';
   const awayHex = s.awayColorHex || '#0A84FF';
-  const metaLine = status === 'final' ? '' : `${s.half ?? 1}. puoliaika • ${clockStr}`;
 
-  // Important:
-  // - if user opened /share/<token>, keep refreshing by token
-  // - if user opened /share/<matchId>, refresh by matchId
   const refreshId = originalId || s.matchId;
 
   const html = `<!DOCTYPE html>
@@ -209,11 +421,17 @@ function renderSharePage(res, s, originalId) {
   :root { --glass-bg: rgba(255,255,255,0.7); --glass-border: rgba(0,0,0,0.08); --text:#111; --subtle:#666; }
   * { box-sizing: border-box; }
   body { margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; background: linear-gradient(180deg, #f7f8fa, #eef3f7); color: var(--text); }
-  .container { max-width: 860px; margin: 16px auto; padding: 16px; background: var(--glass-bg); border: 1px solid var(--glass-border); border-radius: 16px; box-shadow: 0 6px 20px rgba(0,0,0,0.06); }
+  .page { max-width: 860px; margin: 16px auto; padding: 0 16px; }
+  .topbar { display: flex; justify-content: flex-end; margin-bottom: 12px; }
+  .lang-switch { display: inline-flex; gap: 8px; }
+  .lang-btn { border: 1px solid rgba(0,0,0,0.12); background: #fff; border-radius: 10px; padding: 8px 10px; cursor: pointer; font-size: 13px; }
+  .lang-btn.active { background: #111; color: #fff; }
+  .container { max-width: 860px; padding: 16px; background: var(--glass-bg); border: 1px solid var(--glass-border); border-radius: 16px; box-shadow: 0 6px 20px rgba(0,0,0,0.06); }
   header { text-align: center; margin-bottom: 10px; }
   header .line { font-size: 24px; font-weight: 700; }
   header .status { margin-top: 4px; font-size: 13px; color: var(--subtle); min-height: 18px; }
   header .meta { margin-top: 6px; font-size: 12px; color: var(--subtle); }
+  .section-title { font-size: 12px; font-weight: 700; letter-spacing: 0.04em; text-transform: uppercase; color: var(--subtle); margin-bottom: 6px; }
   .possession { margin: 16px 0 8px; }
   .possession .bar { position: relative; height: 12px; background: rgba(0,0,0,0.1); border-radius: 999px; overflow: hidden; }
   .possession .fill { position: absolute; left: 0; top: 0; bottom: 0; width: ${homePossessionPercent}%; background: ${homeHex}CC; border-radius: 999px; transition: width 0.3s ease; }
@@ -221,45 +439,53 @@ function renderSharePage(res, s, originalId) {
   .stats-grid { display: flex; gap: 24px; margin-top: 14px; }
   .side { flex: 1 1 0; }
   .side h3 { margin: 0 0 6px; font-size: 15px; font-weight: 700; }
-  .item { display: flex; align-items: center; gap: 6px; font-size: 13px; color: #222; }
+  .item { display: flex; align-items: center; gap: 6px; font-size: 13px; color: #222; margin-bottom: 4px; }
   .item .val { margin-left: auto; font-weight: 600; }
+  .label { white-space: nowrap; }
+  @media (max-width: 700px) {
+    .stats-grid { flex-direction: column; gap: 14px; }
+  }
 </style>
 </head>
 <body>
-  <div class="container" role="main" aria-label="Match Quick Stats">
-    <header>
-      <div class="line">${s.home ?? 'Koti'} ${s.scoreHome ?? 0} – ${s.scoreAway ?? 0} ${s.away ?? 'Vieras'}</div>
-      <div class="status">${statusText}</div>
-      <div class="meta">${metaLine}</div>
-    </header>
+  <div class="page">
+    ${renderLangSwitcher()}
+    <div class="container" role="main" aria-label="Match Quick Stats">
+      <header>
+        <div class="line" id="scoreLine">${escapeHtml(s.home ?? 'Koti')} ${escapeHtml(String(s.scoreHome ?? 0))} – ${escapeHtml(String(s.scoreAway ?? 0))} ${escapeHtml(s.away ?? 'Vieras')}</div>
+        <div class="status" id="statusText"></div>
+        <div class="meta" id="metaLine"></div>
+      </header>
 
-    <section class="possession" aria-label="Pallonhallinta">
-      <div class="bar" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${homePossessionPercent}">
-        <div class="fill" id="posFill"></div>
-      </div>
-      <div class="legend">
-        <span id="posHome">${s.home ?? 'Koti'} ${homePossessionPercent}%</span>
-        <span id="posAway">${s.away ?? 'Vieras'} ${awayPossessionPercent}%</span>
-      </div>
-    </section>
+      <section class="possession" aria-label="Pallonhallinta">
+        <div class="section-title" id="possessionTitle">Pallonhallinta</div>
+        <div class="bar" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${homePossessionPercent}">
+          <div class="fill" id="posFill"></div>
+        </div>
+        <div class="legend">
+          <span id="posHome">${escapeHtml(s.home ?? 'Koti')} ${escapeHtml(String(homePossessionPercent))}%</span>
+          <span id="posAway">${escapeHtml(s.away ?? 'Vieras')} ${escapeHtml(String(awayPossessionPercent))}%</span>
+        </div>
+      </section>
 
-    <section class="stats-grid">
-      <div class="side" style="color:${homeHex}">
-        <h3>${s.home ?? 'Koti'}</h3>
-        <div class="item">🎯 xG <span class="val" id="homeXG">${Number(s.homeXG || 0).toFixed(2)}</span></div>
-        <div class="item">⚽️ Laukaukset <span class="val" id="homeShots">${s.homeShots ?? 0}</span></div>
-        <div class="item">🚩 Kulmapotkut <span class="val" id="homeCorners">${s.homeCorners ?? 0}</span></div>
-      </div>
-      <div class="side" style="text-align:right; color:${awayHex}">
-        <h3>${s.away ?? 'Vieras'}</h3>
-        <div class="item">🎯 xG <span class="val" id="awayXG">${Number(s.awayXG || 0).toFixed(2)}</span></div>
-        <div class="item">⚽️ Laukaukset <span class="val" id="awayShots">${s.awayShots ?? 0}</span></div>
-        <div class="item">🚩 Kulmapotkut <span class="val" id="awayCorners">${s.awayCorners ?? 0}</span></div>
-      </div>
-    </section>
+      <section class="stats-grid">
+        <div class="side" style="color:${escapeHtml(homeHex)}">
+          <h3 id="homeTitle">${escapeHtml(s.home ?? 'Koti')}</h3>
+          <div class="item"><span class="label">🎯 xG</span><span class="val" id="homeXG">${escapeHtml(Number(s.homeXG || 0).toFixed(2))}</span></div>
+          <div class="item"><span class="label shots-label">⚽️ Laukaukset</span><span class="val" id="homeShots">${escapeHtml(String(s.homeShots ?? 0))}</span></div>
+          <div class="item"><span class="label corners-label">🚩 Kulmapotkut</span><span class="val" id="homeCorners">${escapeHtml(String(s.homeCorners ?? 0))}</span></div>
+        </div>
+        <div class="side" style="text-align:right; color:${escapeHtml(awayHex)}">
+          <h3 id="awayTitle">${escapeHtml(s.away ?? 'Vieras')}</h3>
+          <div class="item"><span class="label">🎯 xG</span><span class="val" id="awayXG">${escapeHtml(Number(s.awayXG || 0).toFixed(2))}</span></div>
+          <div class="item"><span class="label shots-label">⚽️ Laukaukset</span><span class="val" id="awayShots">${escapeHtml(String(s.awayShots ?? 0))}</span></div>
+          <div class="item"><span class="label corners-label">🚩 Kulmapotkut</span><span class="val" id="awayCorners">${escapeHtml(String(s.awayCorners ?? 0))}</span></div>
+        </div>
+      </section>
+    </div>
   </div>
 
-  <script>
+  ${renderSharedClientHelpers(`
     function pad(n) {
       return String(n).padStart(2, '0');
     }
@@ -285,6 +511,59 @@ function renderSharePage(res, s, originalId) {
     }
 
     const id = ${JSON.stringify(refreshId)};
+    let latestData = ${JSON.stringify(s)};
+
+    function renderFromData(data) {
+      latestData = data || latestData;
+      const lang = getCurrentLang();
+      const dict = getDictionary(lang);
+
+      const status = latestData.status || (latestData.isEnded ? 'final' : (latestData.isPaused ? 'paused' : 'live'));
+      const pct = pickPct(latestData);
+      const homePct = Math.max(0, Math.min(100, pct.home | 0));
+      const awayPct = Math.max(0, Math.min(100, pct.away | 0));
+
+      document.title = dict.shareTitle;
+      document.getElementById('scoreLine').textContent =
+        (latestData.home ?? 'Koti') + ' ' +
+        (latestData.scoreHome ?? 0) + ' – ' +
+        (latestData.scoreAway ?? 0) + ' ' +
+        (latestData.away ?? 'Vieras');
+
+      document.getElementById('statusText').textContent = getStatusText(status, lang);
+      document.getElementById('metaLine').textContent =
+        status === 'final' ? '' : (getHalfText(latestData.half ?? 1, lang) + ' • ' + mmss(latestData.matchSeconds ?? 0));
+
+      document.getElementById('possessionTitle').textContent = dict.possession;
+      document.getElementById('homeTitle').textContent = latestData.home ?? 'Koti';
+      document.getElementById('awayTitle').textContent = latestData.away ?? 'Vieras';
+
+      document.querySelectorAll('.shots-label').forEach(function (el) {
+        el.textContent = '⚽️ ' + dict.shots;
+      });
+
+      document.querySelectorAll('.corners-label').forEach(function (el) {
+        el.textContent = '🚩 ' + dict.corners;
+      });
+
+      const fill = document.getElementById('posFill');
+      fill.style.width = homePct + '%';
+      fill.style.background = (latestData.homeColorHex || '#FF3B30') + 'CC';
+
+      document.getElementById('posHome').textContent = (latestData.home ?? 'Koti') + ' ' + homePct + '%';
+      document.getElementById('posAway').textContent = (latestData.away ?? 'Vieras') + ' ' + awayPct + '%';
+
+      document.getElementById('homeXG').textContent = Number(latestData.homeXG || 0).toFixed(2);
+      document.getElementById('awayXG').textContent = Number(latestData.awayXG || 0).toFixed(2);
+      document.getElementById('homeShots').textContent = String(latestData.homeShots ?? '0');
+      document.getElementById('awayShots').textContent = String(latestData.awayShots ?? '0');
+      document.getElementById('homeCorners').textContent = String(latestData.homeCorners ?? '0');
+      document.getElementById('awayCorners').textContent = String(latestData.awayCorners ?? '0');
+    }
+
+    function applyPageLanguage() {
+      renderFromData(latestData);
+    }
 
     async function refresh() {
       try {
@@ -292,61 +571,96 @@ function renderSharePage(res, s, originalId) {
           cache: 'no-store'
         });
 
-        // If token now has multiple matches, reload page so /share/<token>
-        // becomes the selection page.
         if (res.status === 409) {
           window.location.reload();
           return;
         }
 
-        // If current match/token no longer resolves, reload.
         if (res.status === 404) {
-          window.location.reload();
+          window.location.href = '/list';
           return;
         }
 
         if (!res.ok) return;
 
         const data = await res.json();
-
-        document.querySelector('header .line').textContent =
-          (data.home ?? 'Koti') + ' ' +
-          (data.scoreHome ?? 0) + ' – ' +
-          (data.scoreAway ?? 0) + ' ' +
-          (data.away ?? 'Vieras');
-
-        const status = data.status || (data.isEnded ? 'final' : (data.isPaused ? 'paused' : 'live'));
-        const statusText = data.statusTextFi || (status === 'final' ? 'Lopputulos' : '');
-
-        document.querySelector('header .status').textContent = statusText || '';
-        document.querySelector('header .meta').textContent =
-          status === 'final' ? '' : ((data.half ?? 1) + '. puoliaika • ' + mmss(data.matchSeconds ?? 0));
-
-        const pct = pickPct(data);
-        const homePct = Math.max(0, Math.min(100, pct.home | 0));
-        const awayPct = Math.max(0, Math.min(100, pct.away | 0));
-
-        const fill = document.getElementById('posFill');
-        fill.style.width = homePct + '%';
-        fill.style.background = (data.homeColorHex || '#0A84FF') + 'CC';
-
-        document.getElementById('posHome').textContent = (data.home ?? 'Koti') + ' ' + homePct + '%';
-        document.getElementById('posAway').textContent = (data.away ?? 'Vieras') + ' ' + awayPct + '%';
-
-        document.getElementById('homeXG').textContent = Number(data.homeXG || 0).toFixed(2);
-        document.getElementById('awayXG').textContent = Number(data.awayXG || 0).toFixed(2);
-        document.getElementById('homeShots').textContent = String(data.homeShots ?? '0');
-        document.getElementById('awayShots').textContent = String(data.awayShots ?? '0');
-        document.getElementById('homeCorners').textContent = String(data.homeCorners ?? '0');
-        document.getElementById('awayCorners').textContent = String(data.awayCorners ?? '0');
+        renderFromData(data);
       } catch (e) {
         // ignore
       }
     }
 
+    wireLanguageButtons(applyPageLanguage);
+    renderFromData(latestData);
     refresh();
     setInterval(refresh, 2000);
-  </script>
+  `)}
+</body>
+</html>`;
+
+  res.setHeader('Content-Type', 'text/html; charset=utf-8');
+  res.setHeader('Cache-Control', 'no-store');
+  res.send(html);
+}
+
+function renderSelectionPage(res, tokenMatches) {
+  const html = `<!doctype html>
+<html lang="fi">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Valitse ottelu</title>
+  <meta http-equiv="refresh" content="15" />
+  <style>
+    body { margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; background: #f7f8fa; color: #111; }
+    .wrap { max-width: 900px; margin: 20px auto; padding: 0 16px; }
+    .topbar { display: flex; justify-content: flex-end; margin-bottom: 12px; }
+    .lang-switch { display: inline-flex; gap: 8px; }
+    .lang-btn { border: 1px solid rgba(0,0,0,0.12); background: #fff; border-radius: 10px; padding: 8px 10px; cursor: pointer; font-size: 13px; }
+    .lang-btn.active { background: #111; color: #fff; }
+    h1 { font-size: 22px; margin: 6px 0 12px; }
+    .hint { color: #666; font-size: 13px; margin-bottom: 12px; }
+    .card { background: #fff; border: 1px solid rgba(0,0,0,0.08); border-radius: 12px; padding: 14px; margin-bottom: 10px; }
+    .line { font-size: 18px; font-weight: 700; margin-bottom: 6px; }
+    .meta { font-size: 13px; color: #666; margin-bottom: 8px; }
+    a { font-size: 14px; color: #0a58ca; text-decoration: none; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    ${renderLangSwitcher()}
+    <h1 id="selectionTitle">Valitse ottelu</h1>
+    <div class="hint" id="selectionHint">Tällä tokenilla on useita aktiivisia otteluita.</div>
+    ${tokenMatches.map((s) => {
+      const status = getStatus(s);
+      return `<div class="card">
+        <div class="line">${escapeHtml(s.home ?? 'Koti')} ${escapeHtml(String(s.scoreHome ?? 0))} – ${escapeHtml(String(s.scoreAway ?? 0))} ${escapeHtml(s.away ?? 'Vieras')}</div>
+        <div class="meta" data-status="${escapeHtml(status)}"></div>
+        <a href="/share/${encodeURIComponent(s.matchId)}" class="open-match-link">Avaa ottelu</a>
+      </div>`;
+    }).join('')}
+  </div>
+
+  ${renderSharedClientHelpers(`
+    function applyPageLanguage() {
+      const lang = getCurrentLang();
+      const dict = getDictionary(lang);
+
+      document.title = dict.selectMatch;
+      document.getElementById('selectionTitle').textContent = dict.selectMatch;
+      document.getElementById('selectionHint').textContent = dict.multiMatches;
+
+      document.querySelectorAll('[data-status]').forEach(function (el) {
+        el.textContent = getStatusText(el.dataset.status, lang);
+      });
+
+      document.querySelectorAll('.open-match-link').forEach(function (el) {
+        el.textContent = dict.openMatch;
+      });
+    }
+
+    wireLanguageButtons(applyPageLanguage);
+  `)}
 </body>
 </html>`;
 
@@ -358,7 +672,7 @@ function renderSharePage(res, s, originalId) {
 // POST snapshot from app
 app.post('/api/snapshot', (req, res) => {
   const auth = req.headers.authorization || '';
-  const m = auth.match(/^Bearer\s+(.*)$/i);
+  const m = auth.match(/^Bearer\\s+(.*)$/i);
 
   if (!m) {
     return res.status(401).json({ error: 'Unauthorized: missing or invalid token' });
@@ -539,7 +853,7 @@ app.get('/share/:id', (req, res) => {
   if (matches.has(id)) {
     const rec = matches.get(id);
     if (!rec || !isFresh(rec)) {
-      return res.status(404).send('Snapshot not found');
+      return renderNoMatchesPage(res);
     }
     return renderSharePage(res, rec, id);
   }
@@ -548,52 +862,14 @@ app.get('/share/:id', (req, res) => {
   const tokenMatches = getMatchesForToken(id);
 
   if (tokenMatches.length === 0) {
-    return res.status(404).send('Snapshot not found');
+    return renderNoMatchesPage(res);
   }
 
   if (tokenMatches.length === 1) {
     return renderSharePage(res, tokenMatches[0], id);
   }
 
-  // Multiple matches for token -> selection page
-  const html = `<!doctype html>
-<html lang="fi">
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Valitse ottelu</title>
-  <meta http-equiv="refresh" content="15" />
-  <style>
-    body { margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; background: #f7f8fa; color: #111; }
-    .wrap { max-width: 900px; margin: 20px auto; padding: 0 16px; }
-    h1 { font-size: 22px; margin: 6px 0 12px; }
-    .hint { color: #666; font-size: 13px; margin-bottom: 12px; }
-    .card { background: #fff; border: 1px solid rgba(0,0,0,0.08); border-radius: 12px; padding: 14px; margin-bottom: 10px; }
-    .line { font-size: 18px; font-weight: 700; margin-bottom: 6px; }
-    .meta { font-size: 13px; color: #666; margin-bottom: 8px; }
-    a { font-size: 14px; }
-  </style>
-</head>
-<body>
-  <div class="wrap">
-    <h1>Valitse ottelu</h1>
-    <div class="hint">Tällä tokenilla on useita aktiivisia otteluita.</div>
-    ${tokenMatches.map((s) => {
-      const status = getStatus(s);
-      const statusFi = status === 'final' ? 'Lopputulos' : (status === 'paused' ? 'Tauko' : 'Käynnissä');
-      return `<div class="card">
-        <div class="line">${s.home ?? 'Koti'} ${s.scoreHome ?? 0} – ${s.scoreAway ?? 0} ${s.away ?? 'Vieras'}</div>
-        <div class="meta">${statusFi}</div>
-        <a href="/share/${encodeURIComponent(s.matchId)}">Avaa ottelu</a>
-      </div>`;
-    }).join('')}
-  </div>
-</body>
-</html>`;
-
-  res.setHeader('Content-Type', 'text/html; charset=utf-8');
-  res.setHeader('Cache-Control', 'no-store');
-  res.send(html);
+  return renderSelectionPage(res, tokenMatches);
 });
 
 // List page
@@ -605,11 +881,15 @@ app.get('/list', (req, res) => {
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Liveseuranta – Ottelulista</title>
+  <title>Liveseuranta – ottelut</title>
   <meta http-equiv="refresh" content="15" />
   <style>
     body { margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; background: #f7f8fa; color: #111; }
     .wrap { max-width: 980px; margin: 20px auto; padding: 0 16px; }
+    .topbar { display: flex; justify-content: flex-end; margin-bottom: 12px; }
+    .lang-switch { display: inline-flex; gap: 8px; }
+    .lang-btn { border: 1px solid rgba(0,0,0,0.12); background: #fff; border-radius: 10px; padding: 8px 10px; cursor: pointer; font-size: 13px; }
+    .lang-btn.active { background: #111; color: #fff; }
     h1 { font-size: 22px; margin: 6px 0 12px; }
     .hint { color: #666; font-size: 13px; margin-bottom: 12px; }
     table { width: 100%; border-collapse: collapse; background: rgba(255,255,255,0.9); border: 1px solid rgba(0,0,0,0.08); border-radius: 12px; overflow: hidden; }
@@ -617,26 +897,27 @@ app.get('/list', (req, res) => {
     th { background: rgba(0,0,0,0.04); text-align: left; }
     tr:last-child td { border-bottom: none; }
     .status { font-size: 12px; color: #666; }
-    .links a { margin-right: 8px; font-size: 13px; }
-    .empty { padding: 12px 0; color: #666; }
+    .links a { margin-right: 8px; font-size: 13px; color: #0a58ca; text-decoration: none; }
+    .empty { padding: 16px; color: #666; background: rgba(255,255,255,0.9); border: 1px solid rgba(0,0,0,0.08); border-radius: 12px; }
     .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; color: #666; }
   </style>
 </head>
 <body>
   <div class="wrap">
-    <h1>Liveseuranta – ottelut (${items.length})</h1>
-    <div class="hint">Näytetään ottelut, joita on päivitetty viimeisen ${TTL_HOURS} tunnin aikana.</div>
+    ${renderLangSwitcher()}
+    <h1 id="listTitle" data-count="${items.length}">Liveseuranta – ottelut (${items.length})</h1>
+    <div class="hint" id="listHint">Näytetään ottelut, joita on päivitetty viimeisen ${TTL_DAYS} päivän aikana.</div>
     ${
       items.length === 0
-        ? '<div class="empty">Ei aktiivisia otteluita. Päivitä sivu hetken päästä tai aloita uusi liveseuranta sovelluksesta.</div>'
+        ? '<div class="empty" id="emptyText">Otteluseurannassa ei ole käynnissä olevia otteluita.</div>'
         : `<table>
             <thead>
               <tr>
-                <th>Ottelu</th>
-                <th>Tulos</th>
-                <th>Status</th>
-                <th>Päivitetty</th>
-                <th>Linkit</th>
+                <th id="thMatch">Ottelu</th>
+                <th id="thScore">Tulos</th>
+                <th id="thStatus">Status</th>
+                <th id="thUpdated">Päivitetty</th>
+                <th id="thLinks">Linkit</th>
               </tr>
             </thead>
             <tbody>
@@ -644,22 +925,21 @@ app.get('/list', (req, res) => {
                 const d = new Date(i.updatedAt);
                 const dateStr = d.toLocaleString('fi-FI', { dateStyle: 'short', timeStyle: 'medium' });
                 const score = `${i.scoreHome} – ${i.scoreAway}`;
-                const statusFi = i.status === 'final' ? 'Lopputulos' : (i.status === 'paused' ? 'Tauko' : 'Käynnissä');
                 const mid = encodeURIComponent(i.matchId);
                 const tok = encodeURIComponent(i.token || '');
 
                 return `<tr>
                   <td>
-                    <div>${i.home} – ${i.away}</div>
-                    <div class="mono">${i.matchId}</div>
+                    <div>${escapeHtml(i.home)} – ${escapeHtml(i.away)}</div>
+                    <div class="mono">${escapeHtml(i.matchId)}</div>
                   </td>
-                  <td>${score}</td>
-                  <td class="status">${statusFi}</td>
-                  <td class="status">${dateStr}</td>
+                  <td>${escapeHtml(score)}</td>
+                  <td class="status" data-status="${escapeHtml(i.status)}"></td>
+                  <td class="status">${escapeHtml(dateStr)}</td>
                   <td class="links">
-                    <a href="/share/${mid}">Share-sivu</a>
-                    ${i.token ? `<a href="/share/${tok}">Token-sivu</a>` : ''}
-                    <a href="/api/snapshot/${mid}">JSON</a>
+                    <a href="/share/${mid}" class="share-link">Share-sivu</a>
+                    ${i.token ? `<a href="/share/${tok}" class="token-link">Token-sivu</a>` : ''}
+                    <a href="/api/snapshot/${mid}" class="json-link">JSON</a>
                   </td>
                 </tr>`;
               }).join('')}
@@ -667,6 +947,54 @@ app.get('/list', (req, res) => {
           </table>`
     }
   </div>
+
+  ${renderSharedClientHelpers(`
+    const count = ${JSON.stringify(items.length)};
+
+    function applyPageLanguage() {
+      const lang = getCurrentLang();
+      const dict = getDictionary(lang);
+
+      document.title = dict.listTitle;
+      document.getElementById('listTitle').textContent = dict.listTitle + ' (' + count + ')';
+      document.getElementById('listHint').textContent = formatText(dict.daysHint, { days: TTL_DAYS });
+
+      const empty = document.getElementById('emptyText');
+      if (empty) {
+        empty.textContent = dict.noMatches;
+      }
+
+      const thMatch = document.getElementById('thMatch');
+      const thScore = document.getElementById('thScore');
+      const thStatus = document.getElementById('thStatus');
+      const thUpdated = document.getElementById('thUpdated');
+      const thLinks = document.getElementById('thLinks');
+
+      if (thMatch) thMatch.textContent = dict.match;
+      if (thScore) thScore.textContent = dict.score;
+      if (thStatus) thStatus.textContent = dict.status;
+      if (thUpdated) thUpdated.textContent = dict.updated;
+      if (thLinks) thLinks.textContent = dict.links;
+
+      document.querySelectorAll('[data-status]').forEach(function (el) {
+        el.textContent = getStatusText(el.dataset.status, lang);
+      });
+
+      document.querySelectorAll('.share-link').forEach(function (el) {
+        el.textContent = dict.sharePage;
+      });
+
+      document.querySelectorAll('.token-link').forEach(function (el) {
+        el.textContent = dict.tokenPage;
+      });
+
+      document.querySelectorAll('.json-link').forEach(function (el) {
+        el.textContent = dict.json;
+      });
+    }
+
+    wireLanguageButtons(applyPageLanguage);
+  `)}
 </body>
 </html>`;
 
@@ -679,5 +1007,5 @@ app.use(express.static(path.join(__dirname, 'public')));
 
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
-  console.log(`Server listening on port ${PORT}`);
+  console.log(\`Server listening on port \${PORT}\`);
 });
