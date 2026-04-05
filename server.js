@@ -672,7 +672,7 @@ function renderSelectionPage(res, tokenMatches) {
 // POST snapshot from app
 app.post('/api/snapshot', (req, res) => {
   const auth = req.headers.authorization || '';
-  const m = auth.match(/^Bearer\\s+(.*)$/i);
+  const m = auth.match(/^Bearer\s+(.*)$/i);
 
   if (!m) {
     return res.status(401).json({ error: 'Unauthorized: missing or invalid token' });
