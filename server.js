@@ -2,87 +2,93 @@
 
 const express = require('express');
 const path = require('path');
+const fs = require('fs');
+const sqlite3 = require('sqlite3').verbose();
 
 const app = express();
 app.use(express.json({ limit: '1mb' }));
 
-// matchId -> latest snapshot for that match
+// In-memory live matches
+// matchId -> latest snapshot
 const matches = new Map();
 
 // token -> Set of matchIds
 const tokenToMatchIds = new Map();
 
-// Keep matches visible for last N days
+// Live visibility TTL
 const TTL_DAYS = Number(process.env.LIVE_TTL_DAYS || 7);
 const TTL_MS = Number(process.env.LIVE_TTL_MS || TTL_DAYS * 24 * 60 * 60 * 1000);
 
-const I18N = {
-  fi: {
-    shareTitle: 'Liveseuranta',
-    listTitle: 'Liveseuranta – ottelut',
-    selectMatch: 'Valitse ottelu',
-    multiMatches: 'Tällä tokenilla on useita aktiivisia otteluita.',
-    noMatches: 'Otteluseurannassa ei ole käynnissä olevia otteluita.',
-    daysHint: 'Näytetään ottelut, joita on päivitetty viimeisen {days} päivän aikana.',
-    statusFinal: 'Lopputulos',
-    statusPaused: 'Tauko',
-    statusLive: 'Käynnissä',
-    possession: 'Pallonhallinta',
-    shots: 'Laukaukset',
-    corners: 'Kulmapotkut',
-    match: 'Ottelu',
-    score: 'Tulos',
-    status: 'Status',
-    links: 'Linkki',
-    sharePage: 'Seurantasivulle',
-    openMatch: 'Avaa ottelu',
-    backToList: 'Takaisin ottelulistaan'
-  },
-  en: {
-    shareTitle: 'Live match tracker',
-    listTitle: 'Live match tracker – matches',
-    selectMatch: 'Select match',
-    multiMatches: 'This token has multiple active matches.',
-    noMatches: 'There are no active matches in the match tracker.',
-    daysHint: 'Showing matches updated during the last {days} days.',
-    statusFinal: 'Final',
-    statusPaused: 'Half-time',
-    statusLive: 'Live',
-    possession: 'Possession',
-    shots: 'Shots',
-    corners: 'Corners',
-    match: 'Match',
-    score: 'Score',
-    status: 'Status',
-    links: 'Link',
-    sharePage: 'To tracking page',
-    openMatch: 'Open match',
-    backToList: 'Back to match list'
-  },
-  sv: {
-    shareTitle: 'Liveuppföljning',
-    listTitle: 'Liveuppföljning – matcher',
-    selectMatch: 'Välj match',
-    multiMatches: 'Den här tokenen har flera aktiva matcher.',
-    noMatches: 'Det finns inga pågående matcher i matchuppföljningen.',
-    daysHint: 'Visar matcher som har uppdaterats under de senaste {days} dagarna.',
-    statusFinal: 'Slutresultat',
-    statusPaused: 'Paus',
-    statusLive: 'Pågår',
-    possession: 'Bollinnehav',
-    shots: 'Skott',
-    corners: 'Hörnor',
-    match: 'Match',
-    score: 'Resultat',
-    status: 'Status',
-    links: 'Länk',
-    sharePage: 'Till matchsidan',
-    openMatch: 'Öppna match',
-    backToList: 'Tillbaka till matchlistan'
-  }
-};
+// Persistent final results
+const FINAL_DB_PATH =
+  process.env.FINAL_DB_PATH || path.join(__dirname, 'data', 'final-results.sqlite');
 
-const I18N_JSON = JSON.stringify(I18N);
+const ADMIN_TOKEN = String(process.env.ADMIN_TOKEN || '').trim();
+
+fs.mkdirSync(path.dirname(FINAL_DB_PATH), { recursive: true });
+
+const db = new sqlite3.Database(FINAL_DB_PATH);
+
+function dbRun(sql, params = []) {
+  return new Promise((resolve, reject) => {
+    db.run(sql, params, function onRun(err) {
+      if (err) return reject(err);
+      resolve(this);
+    });
+  });
+}
+
+function dbGet(sql, params = []) {
+  return new Promise((resolve, reject) => {
+    db.get(sql, params, (err, row) => {
+      if (err) return reject(err);
+      resolve(row || null);
+    });
+  });
+}
+
+function dbAll(sql, params = []) {
+  return new Promise((resolve, reject) => {
+    db.all(sql, params, (err, rows) => {
+      if (err) return reject(err);
+      resolve(rows || []);
+    });
+  });
+}
+
+async function initDb() {
+  await dbRun(`
+    CREATE TABLE IF NOT EXISTS final_results (
+      match_id TEXT PRIMARY KEY,
+      token TEXT,
+      home TEXT NOT NULL,
+      away TEXT NOT NULL,
+      score_home INTEGER NOT NULL DEFAULT 0,
+      score_away INTEGER NOT NULL DEFAULT 0,
+      status TEXT NOT NULL,
+      snapshot_json TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      deleted_at TEXT
+    )
+  `);
+
+  await dbRun(`
+    CREATE INDEX IF NOT EXISTS idx_final_results_updated_at
+    ON final_results(updated_at DESC)
+  `);
+
+  await dbRun(`
+    CREATE INDEX IF NOT EXISTS idx_final_results_deleted_at
+    ON final_results(deleted_at)
+  `);
+}
+
+function asyncHandler(fn) {
+  return (req, res, next) => {
+    Promise.resolve(fn(req, res, next)).catch(next);
+  };
+}
 
 function escapeHtml(value = '') {
   return String(value)
@@ -103,11 +109,18 @@ function slugify(str = '') {
     .replace(/^-+|-+$/g, '');
 }
 
-// Fallback Match ID (käytetään vain jos client ei toimita MatchID:tä)
 function buildMatchId(obj = {}) {
   const home = slugify(obj.home || obj.homeTeam || 'koti');
   const away = slugify(obj.away || obj.awayTeam || 'vieras');
-  return home + '__' + away;
+  return `${home}__${away}`;
+}
+
+function pickIncomingMatchId(req, body = {}) {
+  const bodyMatchId = String(body.matchId || '').trim();
+  const bodyMatchID = String(body.matchID || '').trim();
+  const headerMatchId = String(req.headers['x-match-id'] || '').trim();
+
+  return bodyMatchId || bodyMatchID || headerMatchId || buildMatchId(body);
 }
 
 function pickPossession(obj = {}) {
@@ -139,7 +152,7 @@ function pickPossession(obj = {}) {
   a = Math.max(0, Math.min(100, Number(a)));
 
   if (h + a !== 100) {
-    a = 100 - h;
+    a = Math.max(0, 100 - h);
   }
 
   return { h, a };
@@ -149,11 +162,38 @@ function getStatus(rec = {}) {
   return rec.status || (rec.isEnded ? 'final' : (rec.isPaused ? 'paused' : 'live'));
 }
 
+function statusLabelFi(status) {
+  if (status === 'final') return 'Lopputulos';
+  if (status === 'paused') return 'Tauko';
+  return 'Käynnissä';
+}
+
 function isFresh(rec) {
   if (!rec || !rec.updatedAt) return false;
   const t = Date.parse(rec.updatedAt);
   if (Number.isNaN(t)) return false;
   return (Date.now() - t) < TTL_MS;
+}
+
+function attachMatchToToken(token, matchId) {
+  if (!token) return;
+
+  let ids = tokenToMatchIds.get(token);
+  if (!ids) {
+    ids = new Set();
+    tokenToMatchIds.set(token, ids);
+  }
+  ids.add(matchId);
+}
+
+function removeMatchFromToken(token, matchId) {
+  const ids = tokenToMatchIds.get(token);
+  if (!ids) return;
+
+  ids.delete(matchId);
+  if (ids.size === 0) {
+    tokenToMatchIds.delete(token);
+  }
 }
 
 function getMatchesForToken(token = '') {
@@ -173,23 +213,6 @@ function getMatchesForToken(token = '') {
 
   out.sort((a, b) => Date.parse(b.updatedAt) - Date.parse(a.updatedAt));
   return out;
-}
-
-function getMatchByIdentifier(id = '') {
-  const key = String(id || '').trim();
-  if (!key) return null;
-
-  if (matches.has(key)) {
-    const rec = matches.get(key);
-    return isFresh(rec) ? rec : null;
-  }
-
-  const tokenMatches = getMatchesForToken(key);
-  if (tokenMatches.length === 1) {
-    return tokenMatches[0];
-  }
-
-  return null;
 }
 
 function listFreshMatches() {
@@ -214,157 +237,179 @@ function listFreshMatches() {
   return items;
 }
 
-function attachMatchToToken(token, matchId) {
-  let ids = tokenToMatchIds.get(token);
-  if (!ids) {
-    ids = new Set();
-    tokenToMatchIds.set(token, ids);
+function getBearerToken(req) {
+  const auth = req.headers.authorization || '';
+  const m = auth.match(/^Bearer\s+(.*)$/i);
+  if (!m) return '';
+  return String(m[1] || '').trim();
+}
+
+function requireAdmin(req, res, next) {
+  if (!ADMIN_TOKEN) {
+    return res.status(500).json({ error: 'ADMIN_TOKEN is not configured' });
   }
-  ids.add(matchId);
-}
 
-function removeMatchFromToken(token, matchId) {
-  const ids = tokenToMatchIds.get(token);
-  if (!ids) return;
-  ids.delete(matchId);
-  if (ids.size === 0) {
-    tokenToMatchIds.delete(token);
+  const token = getBearerToken(req);
+  if (!token || token !== ADMIN_TOKEN) {
+    return res.status(401).json({ error: 'Unauthorized' });
   }
+
+  next();
 }
 
-function renderLangSwitcher() {
-  return `
-    <div class="topbar">
-      <div class="lang-switch" role="group" aria-label="Language">
-        <button type="button" class="lang-btn" data-lang="fi">FI</button>
-        <button type="button" class="lang-btn" data-lang="en">EN</button>
-        <button type="button" class="lang-btn" data-lang="sv">SV</button>
-      </div>
-    </div>
-  `;
+function rowToRecord(row) {
+  if (!row) return null;
+
+  let snapshot = {};
+  try {
+    snapshot = JSON.parse(row.snapshot_json || '{}');
+  } catch (e) {
+    snapshot = {};
+  }
+
+  return {
+    ...snapshot,
+    token: row.token || snapshot.token || '',
+    matchId: row.match_id,
+    home: row.home,
+    away: row.away,
+    scoreHome: row.score_home ?? snapshot.scoreHome ?? 0,
+    scoreAway: row.score_away ?? snapshot.scoreAway ?? 0,
+    status: row.status || snapshot.status || 'final',
+    isEnded: true,
+    updatedAt: row.updated_at
+  };
 }
 
-function renderSharedClientHelpers(extraScript = '') {
-  return `<script>
-    const I18N = ${I18N_JSON};
-    const TTL_DAYS = ${JSON.stringify(TTL_DAYS)};
-    const DEFAULT_LANG = 'fi';
+async function upsertFinalResult(rec) {
+  const nowISO = new Date().toISOString();
 
-    function getDictionary(lang) {
-      return I18N[lang] || I18N[DEFAULT_LANG];
-    }
-
-    function getCurrentLang() {
-      try {
-        return localStorage.getItem('live_lang') || DEFAULT_LANG;
-      } catch (e) {
-        return DEFAULT_LANG;
-      }
-    }
-
-    function setCurrentLang(lang) {
-      const next = I18N[lang] ? lang : DEFAULT_LANG;
-      try {
-        localStorage.setItem('live_lang', next);
-      } catch (e) {
-        // ignore
-      }
-      document.documentElement.lang = next;
-      document.querySelectorAll('.lang-btn').forEach(function (btn) {
-        btn.classList.toggle('active', btn.dataset.lang === next);
-      });
-      return next;
-    }
-
-    function formatText(text, vars) {
-      return String(text).replace(/\\{(\\w+)\\}/g, function (_, key) {
-        return Object.prototype.hasOwnProperty.call(vars, key) ? String(vars[key]) : '';
-      });
-    }
-
-    function getStatusText(status, lang) {
-      const dict = getDictionary(lang);
-      if (status === 'final') return dict.statusFinal;
-      if (status === 'paused') return dict.statusPaused;
-      return dict.statusLive;
-    }
-
-    function getHalfText(half, lang) {
-      const n = Number(half || 1);
-      if (lang === 'fi') return n + '. puoliaika';
-      if (lang === 'sv') return n + '. halvlek';
-      if (n === 1) return '1st half';
-      if (n === 2) return '2nd half';
-      if (n === 3) return '3rd half';
-      return n + 'th half';
-    }
-
-    function wireLanguageButtons(applyPageLanguage) {
-      document.querySelectorAll('.lang-btn').forEach(function (btn) {
-        btn.addEventListener('click', function () {
-          setCurrentLang(btn.dataset.lang);
-          applyPageLanguage();
-        });
-      });
-
-      setCurrentLang(getCurrentLang());
-      applyPageLanguage();
-    }
-
-    ${extraScript}
-  </script>`;
+  await dbRun(
+    `
+    INSERT INTO final_results (
+      match_id,
+      token,
+      home,
+      away,
+      score_home,
+      score_away,
+      status,
+      snapshot_json,
+      updated_at,
+      created_at,
+      deleted_at
+    )
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+    ON CONFLICT(match_id) DO UPDATE SET
+      token = excluded.token,
+      home = excluded.home,
+      away = excluded.away,
+      score_home = excluded.score_home,
+      score_away = excluded.score_away,
+      status = excluded.status,
+      snapshot_json = excluded.snapshot_json,
+      updated_at = excluded.updated_at,
+      deleted_at = NULL
+    `,
+    [
+      rec.matchId,
+      rec.token || '',
+      rec.home || 'Koti',
+      rec.away || 'Vieras',
+      Number(rec.scoreHome ?? 0),
+      Number(rec.scoreAway ?? 0),
+      'final',
+      JSON.stringify({ ...rec, status: 'final', isEnded: true }),
+      rec.updatedAt || nowISO,
+      nowISO
+    ]
+  );
 }
 
-function renderNoMatchesPage(res) {
-  const html = `<!doctype html>
-<html lang="fi">
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Liveseuranta</title>
-  <style>
-    body { margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; background: #f7f8fa; color: #111; }
-    .wrap { max-width: 820px; margin: 20px auto; padding: 0 16px; }
-    .topbar { display: flex; justify-content: flex-end; margin-bottom: 12px; }
-    .lang-switch { display: inline-flex; gap: 8px; }
-    .lang-btn { border: 1px solid rgba(0,0,0,0.12); background: #fff; border-radius: 10px; padding: 8px 10px; cursor: pointer; font-size: 13px; }
-    .lang-btn.active { background: #111; color: #fff; }
-    .card { background: rgba(255,255,255,0.9); border: 1px solid rgba(0,0,0,0.08); border-radius: 16px; padding: 24px; box-shadow: 0 6px 20px rgba(0,0,0,0.06); }
-    h1 { margin: 0 0 10px; font-size: 24px; }
-    p { margin: 0 0 14px; color: #666; }
-    a { color: #0a58ca; text-decoration: none; }
-  </style>
-</head>
-<body>
-  <div class="wrap">
-    ${renderLangSwitcher()}
-    <div class="card">
-      <h1 id="pageTitle">Liveseuranta</h1>
-      <p id="emptyText">Otteluseurannassa ei ole käynnissä olevia otteluita.</p>
-      <a href="/list" id="backLink">Takaisin ottelulistaan</a>
-    </div>
-  </div>
-  ${renderSharedClientHelpers(`
-    function applyPageLanguage() {
-      const lang = getCurrentLang();
-      const dict = getDictionary(lang);
-      document.title = dict.shareTitle;
-      document.getElementById('pageTitle').textContent = dict.shareTitle;
-      document.getElementById('emptyText').textContent = dict.noMatches;
-      document.getElementById('backLink').textContent = dict.backToList;
-    }
+async function getPersistedFinalByMatchId(matchId) {
+  const row = await dbGet(
+    `
+    SELECT *
+    FROM final_results
+    WHERE match_id = ?
+      AND deleted_at IS NULL
+    LIMIT 1
+    `,
+    [matchId]
+  );
 
-    wireLanguageButtons(applyPageLanguage);
-  `)}
-</body>
-</html>`;
-
-  res.setHeader('Content-Type', 'text/html; charset=utf-8');
-  res.setHeader('Cache-Control', 'no-store');
-  res.status(404).send(html);
+  return rowToRecord(row);
 }
 
-// Cleanup old matches every 15 min
+async function listPersistedFinals() {
+  const rows = await dbAll(
+    `
+    SELECT
+      match_id,
+      token,
+      home,
+      away,
+      score_home,
+      score_away,
+      status,
+      updated_at
+    FROM final_results
+    WHERE deleted_at IS NULL
+    ORDER BY datetime(updated_at) DESC
+    `
+  );
+
+  return rows.map((row) => ({
+    matchId: row.match_id,
+    token: row.token || '',
+    home: row.home || 'Koti',
+    away: row.away || 'Vieras',
+    scoreHome: row.score_home ?? 0,
+    scoreAway: row.score_away ?? 0,
+    status: row.status || 'final',
+    updatedAt: row.updated_at
+  }));
+}
+
+async function listVisibleMatches() {
+  const liveItems = listFreshMatches();
+  const persistedItems = await listPersistedFinals();
+
+  const byId = new Map();
+
+  for (const item of persistedItems) {
+    byId.set(item.matchId, item);
+  }
+
+  for (const item of liveItems) {
+    byId.set(item.matchId, item);
+  }
+
+  return Array.from(byId.values()).sort(
+    (a, b) => Date.parse(b.updatedAt) - Date.parse(a.updatedAt)
+  );
+}
+
+async function softDeleteFinal(matchId) {
+  const deletedAt = new Date().toISOString();
+
+  const result = await dbRun(
+    `
+    UPDATE final_results
+    SET deleted_at = ?
+    WHERE match_id = ?
+      AND deleted_at IS NULL
+    `,
+    [deletedAt, matchId]
+  );
+
+  return {
+    changed: result.changes > 0,
+    deletedAt
+  };
+}
+
+// Cleanup old live matches every 15 min
 setInterval(() => {
   for (const [matchId, rec] of matches.entries()) {
     if (!isFresh(rec)) {
@@ -389,101 +434,188 @@ setInterval(() => {
 }, 15 * 60 * 1000);
 
 function renderSharePage(res, s, originalId) {
-  const possession = pickPossession(s);
-  const homePossessionPercent = possession.h;
-  const awayPossessionPercent = possession.a;
+  const { h: homePossessionPercent, a: awayPossessionPercent } = pickPossession(s);
 
   const secs = Number(s.matchSeconds ?? 0);
   const mm = String(Math.floor(secs / 60)).padStart(2, '0');
   const ss = String(secs % 60).padStart(2, '0');
+  const clockStr = `${mm}:${ss}`;
+
+  const status = getStatus(s);
+  const statusText = s.statusTextFi || (status === 'final' ? 'Lopputulos' : '');
 
   const homeHex = s.homeColorHex || '#FF3B30';
   const awayHex = s.awayColorHex || '#0A84FF';
+  const metaLine = status === 'final' ? '' : `${s.half ?? 1}. puoliaika • ${clockStr}`;
 
-  // if user opened /share/<token>, keep refreshing by token
-  // if user opened /share/<matchId>, refresh by matchId
   const refreshId = originalId || s.matchId;
+
+  const homeName = s.home ?? 'Koti';
+  const awayName = s.away ?? 'Vieras';
 
   const html = `<!DOCTYPE html>
 <html lang="fi">
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>Liveseuranta</title>
+<title>Liveseuranta – ${escapeHtml(homeName)} vs ${escapeHtml(awayName)}</title>
 <style>
-  :root { --glass-bg: rgba(255,255,255,0.7); --glass-border: rgba(0,0,0,0.08); --text:#111; --subtle:#666; }
+  :root {
+    --glass-bg: rgba(255,255,255,0.7);
+    --glass-border: rgba(0,0,0,0.08);
+    --text: #111;
+    --subtle: #666;
+    --link: #0A66FF;
+  }
   * { box-sizing: border-box; }
-  body { margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; background: linear-gradient(180deg, #f7f8fa, #eef3f7); color: var(--text); }
-  .page { max-width: 860px; margin: 16px auto; padding: 0 16px; }
-  .topbar { display: flex; justify-content: flex-end; margin-bottom: 12px; }
-  .lang-switch { display: inline-flex; gap: 8px; }
-  .lang-btn { border: 1px solid rgba(0,0,0,0.12); background: #fff; border-radius: 10px; padding: 8px 10px; cursor: pointer; font-size: 13px; }
-  .lang-btn.active { background: #111; color: #fff; }
-  .back-row { margin-bottom: 12px; }
-  .back-link { color: #0a58ca; text-decoration: none; font-size: 14px; }
-  .container { max-width: 860px; padding: 16px; background: var(--glass-bg); border: 1px solid var(--glass-border); border-radius: 16px; box-shadow: 0 6px 20px rgba(0,0,0,0.06); }
-  header { text-align: center; margin-bottom: 10px; }
-  header .line { font-size: 24px; font-weight: 700; }
-  header .status { margin-top: 4px; font-size: 13px; color: var(--subtle); min-height: 18px; }
-  header .meta { margin-top: 6px; font-size: 12px; color: var(--subtle); }
-  .section-title { font-size: 12px; font-weight: 700; letter-spacing: 0.04em; text-transform: uppercase; color: var(--subtle); margin-bottom: 6px; }
-  .possession { margin: 16px 0 8px; }
-  .possession .bar { position: relative; height: 12px; background: rgba(0,0,0,0.1); border-radius: 999px; overflow: hidden; }
-  .possession .fill { position: absolute; left: 0; top: 0; bottom: 0; width: ${homePossessionPercent}%; background: ${homeHex}CC; border-radius: 999px; transition: width 0.3s ease; }
-  .possession .legend { display: flex; justify-content: space-between; font-size: 12px; margin-top: 6px; }
-  .stats-grid { display: flex; gap: 24px; margin-top: 14px; }
-  .side { flex: 1 1 0; }
-  .side h3 { margin: 0 0 6px; font-size: 15px; font-weight: 700; }
-  .item { display: flex; align-items: center; gap: 6px; font-size: 13px; color: #222; margin-bottom: 4px; }
-  .item .val { margin-left: auto; font-weight: 600; }
-  .label { white-space: nowrap; }
-  @media (max-width: 700px) {
-    .stats-grid { flex-direction: column; gap: 14px; }
+  body {
+    margin: 0;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    background: linear-gradient(180deg, #f7f8fa, #eef3f7);
+    color: var(--text);
+  }
+  .container {
+    max-width: 860px;
+    margin: 16px auto;
+    padding: 16px;
+  }
+  .topbar {
+    margin-bottom: 10px;
+  }
+  .topbar a {
+    color: var(--link);
+    text-decoration: none;
+    font-size: 14px;
+    font-weight: 600;
+  }
+  .card {
+    background: var(--glass-bg);
+    border: 1px solid var(--glass-border);
+    border-radius: 16px;
+    box-shadow: 0 6px 20px rgba(0,0,0,0.06);
+    padding: 16px;
+  }
+  header {
+    text-align: center;
+    margin-bottom: 10px;
+  }
+  header .line {
+    font-size: 24px;
+    font-weight: 700;
+  }
+  header .status {
+    margin-top: 4px;
+    font-size: 13px;
+    color: var(--subtle);
+    min-height: 18px;
+  }
+  header .meta {
+    margin-top: 6px;
+    font-size: 12px;
+    color: var(--subtle);
+  }
+  .possession {
+    margin: 16px 0 8px;
+  }
+  .possession .bar {
+    position: relative;
+    height: 12px;
+    background: rgba(0,0,0,0.1);
+    border-radius: 999px;
+    overflow: hidden;
+  }
+  .possession .fill {
+    position: absolute;
+    left: 0;
+    top: 0;
+    bottom: 0;
+    width: ${homePossessionPercent}%;
+    background: ${homeHex}CC;
+    border-radius: 999px;
+    transition: width 0.3s ease;
+  }
+  .possession .legend {
+    display: flex;
+    justify-content: space-between;
+    font-size: 12px;
+    margin-top: 6px;
+  }
+  .stats-grid {
+    display: flex;
+    gap: 24px;
+    margin-top: 14px;
+  }
+  .side {
+    flex: 1 1 0;
+  }
+  .side h3 {
+    margin: 0 0 6px;
+    font-size: 15px;
+    font-weight: 700;
+  }
+  .item {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 13px;
+    color: #222;
+  }
+  .item .val {
+    margin-left: auto;
+    font-weight: 600;
+  }
+  @media (max-width: 720px) {
+    .stats-grid {
+      flex-direction: column;
+      gap: 12px;
+    }
+    .side[style*="text-align:right"] {
+      text-align: left !important;
+    }
   }
 </style>
 </head>
 <body>
-  <div class="page">
-    ${renderLangSwitcher()}
-    <div class="back-row">
-      <a href="/list" id="backToListLink" class="back-link">Takaisin ottelulistaan</a>
+  <div class="container" role="main" aria-label="Match Quick Stats">
+    <div class="topbar">
+      <a href="/list">← Takaisin ottelulistaan</a>
     </div>
-    <div class="container" role="main" aria-label="Match Quick Stats">
+
+    <div class="card">
       <header>
-        <div class="line" id="scoreLine">${escapeHtml(s.home ?? 'Koti')} ${escapeHtml(String(s.scoreHome ?? 0))} – ${escapeHtml(String(s.scoreAway ?? 0))} ${escapeHtml(s.away ?? 'Vieras')}</div>
-        <div class="status" id="statusText"></div>
-        <div class="meta" id="metaLine"></div>
+        <div class="line">${escapeHtml(homeName)} ${Number(s.scoreHome ?? 0)} – ${Number(s.scoreAway ?? 0)} ${escapeHtml(awayName)}</div>
+        <div class="status">${escapeHtml(statusText)}</div>
+        <div class="meta">${escapeHtml(metaLine)}</div>
       </header>
 
       <section class="possession" aria-label="Pallonhallinta">
-        <div class="section-title" id="possessionTitle">Pallonhallinta</div>
         <div class="bar" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${homePossessionPercent}">
           <div class="fill" id="posFill"></div>
         </div>
         <div class="legend">
-          <span id="posHome">${escapeHtml(s.home ?? 'Koti')} ${escapeHtml(String(homePossessionPercent))}%</span>
-          <span id="posAway">${escapeHtml(s.away ?? 'Vieras')} ${escapeHtml(String(awayPossessionPercent))}%</span>
+          <span id="posHome">${escapeHtml(homeName)} ${homePossessionPercent}%</span>
+          <span id="posAway">${escapeHtml(awayName)} ${awayPossessionPercent}%</span>
         </div>
       </section>
 
       <section class="stats-grid">
-        <div class="side" style="color:${escapeHtml(homeHex)}">
-          <h3 id="homeTitle">${escapeHtml(s.home ?? 'Koti')}</h3>
-          <div class="item"><span class="label">🎯 xG</span><span class="val" id="homeXG">${escapeHtml(Number(s.homeXG || 0).toFixed(2))}</span></div>
-          <div class="item"><span class="label shots-label">⚽️ Laukaukset</span><span class="val" id="homeShots">${escapeHtml(String(s.homeShots ?? 0))}</span></div>
-          <div class="item"><span class="label corners-label">🚩 Kulmapotkut</span><span class="val" id="homeCorners">${escapeHtml(String(s.homeCorners ?? 0))}</span></div>
+        <div class="side" style="color:${homeHex}">
+          <h3>${escapeHtml(homeName)}</h3>
+          <div class="item">🎯 xG <span class="val" id="homeXG">${Number(s.homeXG || 0).toFixed(2)}</span></div>
+          <div class="item">⚽️ Laukaukset <span class="val" id="homeShots">${Number(s.homeShots ?? 0)}</span></div>
+          <div class="item">🚩 Kulmapotkut <span class="val" id="homeCorners">${Number(s.homeCorners ?? 0)}</span></div>
         </div>
-        <div class="side" style="text-align:right; color:${escapeHtml(awayHex)}">
-          <h3 id="awayTitle">${escapeHtml(s.away ?? 'Vieras')}</h3>
-          <div class="item"><span class="label">🎯 xG</span><span class="val" id="awayXG">${escapeHtml(Number(s.awayXG || 0).toFixed(2))}</span></div>
-          <div class="item"><span class="label shots-label">⚽️ Laukaukset</span><span class="val" id="awayShots">${escapeHtml(String(s.awayShots ?? 0))}</span></div>
-          <div class="item"><span class="label corners-label">🚩 Kulmapotkut</span><span class="val" id="awayCorners">${escapeHtml(String(s.awayCorners ?? 0))}</span></div>
+        <div class="side" style="text-align:right; color:${awayHex}">
+          <h3>${escapeHtml(awayName)}</h3>
+          <div class="item">🎯 xG <span class="val" id="awayXG">${Number(s.awayXG || 0).toFixed(2)}</span></div>
+          <div class="item">⚽️ Laukaukset <span class="val" id="awayShots">${Number(s.awayShots ?? 0)}</span></div>
+          <div class="item">🚩 Kulmapotkut <span class="val" id="awayCorners">${Number(s.awayCorners ?? 0)}</span></div>
         </div>
       </section>
     </div>
   </div>
 
-  ${renderSharedClientHelpers(`
+  <script>
     function pad(n) {
       return String(n).padStart(2, '0');
     }
@@ -509,64 +641,6 @@ function renderSharePage(res, s, originalId) {
     }
 
     const id = ${JSON.stringify(refreshId)};
-    let latestData = ${JSON.stringify(s)};
-
-    function renderFromData(data) {
-      latestData = data || latestData;
-      const lang = getCurrentLang();
-      const dict = getDictionary(lang);
-
-      const status = latestData.status || (latestData.isEnded ? 'final' : (latestData.isPaused ? 'paused' : 'live'));
-      const pct = pickPct(latestData);
-      const homePct = Math.max(0, Math.min(100, pct.home | 0));
-      const awayPct = Math.max(0, Math.min(100, pct.away | 0));
-
-      document.title = dict.shareTitle;
-      document.getElementById('scoreLine').textContent =
-        (latestData.home ?? 'Koti') + ' ' +
-        (latestData.scoreHome ?? 0) + ' – ' +
-        (latestData.scoreAway ?? 0) + ' ' +
-        (latestData.away ?? 'Vieras');
-
-      document.getElementById('statusText').textContent = getStatusText(status, lang);
-      document.getElementById('metaLine').textContent =
-        status === 'final' ? '' : (getHalfText(latestData.half ?? 1, lang) + ' • ' + mmss(latestData.matchSeconds ?? 0));
-
-      document.getElementById('possessionTitle').textContent = dict.possession;
-      document.getElementById('homeTitle').textContent = latestData.home ?? 'Koti';
-      document.getElementById('awayTitle').textContent = latestData.away ?? 'Vieras';
-
-      document.querySelectorAll('.shots-label').forEach(function (el) {
-        el.textContent = '⚽️ ' + dict.shots;
-      });
-
-      document.querySelectorAll('.corners-label').forEach(function (el) {
-        el.textContent = '🚩 ' + dict.corners;
-      });
-
-      const backLink = document.getElementById('backToListLink');
-      if (backLink) {
-        backLink.textContent = dict.backToList;
-      }
-
-      const fill = document.getElementById('posFill');
-      fill.style.width = homePct + '%';
-      fill.style.background = (latestData.homeColorHex || '#FF3B30') + 'CC';
-
-      document.getElementById('posHome').textContent = (latestData.home ?? 'Koti') + ' ' + homePct + '%';
-      document.getElementById('posAway').textContent = (latestData.away ?? 'Vieras') + ' ' + awayPct + '%';
-
-      document.getElementById('homeXG').textContent = Number(latestData.homeXG || 0).toFixed(2);
-      document.getElementById('awayXG').textContent = Number(latestData.awayXG || 0).toFixed(2);
-      document.getElementById('homeShots').textContent = String(latestData.homeShots ?? '0');
-      document.getElementById('awayShots').textContent = String(latestData.awayShots ?? '0');
-      document.getElementById('homeCorners').textContent = String(latestData.homeCorners ?? '0');
-      document.getElementById('awayCorners').textContent = String(latestData.awayCorners ?? '0');
-    }
-
-    function applyPageLanguage() {
-      renderFromData(latestData);
-    }
 
     async function refresh() {
       try {
@@ -580,24 +654,51 @@ function renderSharePage(res, s, originalId) {
         }
 
         if (res.status === 404) {
-          window.location.href = '/list';
           return;
         }
 
         if (!res.ok) return;
 
         const data = await res.json();
-        renderFromData(data);
+
+        document.querySelector('header .line').textContent =
+          (data.home ?? 'Koti') + ' ' +
+          (data.scoreHome ?? 0) + ' – ' +
+          (data.scoreAway ?? 0) + ' ' +
+          (data.away ?? 'Vieras');
+
+        const status = data.status || (data.isEnded ? 'final' : (data.isPaused ? 'paused' : 'live'));
+        const statusText = data.statusTextFi || (status === 'final' ? 'Lopputulos' : '');
+
+        document.querySelector('header .status').textContent = statusText || '';
+        document.querySelector('header .meta').textContent =
+          status === 'final' ? '' : ((data.half ?? 1) + '. puoliaika • ' + mmss(data.matchSeconds ?? 0));
+
+        const pct = pickPct(data);
+        const homePct = Math.max(0, Math.min(100, pct.home | 0));
+        const awayPct = Math.max(0, Math.min(100, pct.away | 0));
+
+        const fill = document.getElementById('posFill');
+        fill.style.width = homePct + '%';
+        fill.style.background = (data.homeColorHex || '#FF3B30') + 'CC';
+
+        document.getElementById('posHome').textContent = (data.home ?? 'Koti') + ' ' + homePct + '%';
+        document.getElementById('posAway').textContent = (data.away ?? 'Vieras') + ' ' + awayPct + '%';
+
+        document.getElementById('homeXG').textContent = Number(data.homeXG || 0).toFixed(2);
+        document.getElementById('awayXG').textContent = Number(data.awayXG || 0).toFixed(2);
+        document.getElementById('homeShots').textContent = String(data.homeShots ?? '0');
+        document.getElementById('awayShots').textContent = String(data.awayShots ?? '0');
+        document.getElementById('homeCorners').textContent = String(data.homeCorners ?? '0');
+        document.getElementById('awayCorners').textContent = String(data.awayCorners ?? '0');
       } catch (e) {
         // ignore
       }
     }
 
-    wireLanguageButtons(applyPageLanguage);
-    renderFromData(latestData);
     refresh();
-    setInterval(refresh, 2000);
-  `)}
+    setInterval(refresh, 5000);
+  </script>
 </body>
 </html>`;
 
@@ -606,7 +707,7 @@ function renderSharePage(res, s, originalId) {
   res.send(html);
 }
 
-function renderSelectionPage(res, tokenMatches) {
+function renderTokenSelectionPage(res, tokenMatches) {
   const html = `<!doctype html>
 <html lang="fi">
 <head>
@@ -615,55 +716,65 @@ function renderSelectionPage(res, tokenMatches) {
   <title>Valitse ottelu</title>
   <meta http-equiv="refresh" content="15" />
   <style>
-    body { margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; background: #f7f8fa; color: #111; }
-    .wrap { max-width: 900px; margin: 20px auto; padding: 0 16px; }
-    .topbar { display: flex; justify-content: flex-end; margin-bottom: 12px; }
-    .lang-switch { display: inline-flex; gap: 8px; }
-    .lang-btn { border: 1px solid rgba(0,0,0,0.12); background: #fff; border-radius: 10px; padding: 8px 10px; cursor: pointer; font-size: 13px; }
-    .lang-btn.active { background: #111; color: #fff; }
-    h1 { font-size: 22px; margin: 6px 0 12px; }
-    .hint { color: #666; font-size: 13px; margin-bottom: 12px; }
-    .card { background: #fff; border: 1px solid rgba(0,0,0,0.08); border-radius: 12px; padding: 14px; margin-bottom: 10px; }
-    .line { font-size: 18px; font-weight: 700; margin-bottom: 6px; }
-    .meta { font-size: 13px; color: #666; margin-bottom: 8px; }
-    a { font-size: 14px; color: #0a58ca; text-decoration: none; }
+    body {
+      margin: 0;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      background: #f7f8fa;
+      color: #111;
+    }
+    .wrap {
+      max-width: 900px;
+      margin: 20px auto;
+      padding: 0 16px;
+    }
+    h1 {
+      font-size: 22px;
+      margin: 6px 0 12px;
+    }
+    .hint {
+      color: #666;
+      font-size: 13px;
+      margin-bottom: 12px;
+    }
+    .card {
+      background: #fff;
+      border: 1px solid rgba(0,0,0,0.08);
+      border-radius: 12px;
+      padding: 14px;
+      margin-bottom: 10px;
+    }
+    .line {
+      font-size: 18px;
+      font-weight: 700;
+      margin-bottom: 6px;
+    }
+    .meta {
+      font-size: 13px;
+      color: #666;
+      margin-bottom: 8px;
+    }
+    a {
+      font-size: 14px;
+      color: #0A66FF;
+      text-decoration: none;
+      font-weight: 600;
+    }
   </style>
 </head>
 <body>
   <div class="wrap">
-    ${renderLangSwitcher()}
-    <h1 id="selectionTitle">Valitse ottelu</h1>
-    <div class="hint" id="selectionHint">Tällä tokenilla on useita aktiivisia otteluita.</div>
+    <h1>Valitse ottelu</h1>
+    <div class="hint">Tällä tokenilla on useita aktiivisia otteluita.</div>
     ${tokenMatches.map((s) => {
       const status = getStatus(s);
+      const statusFi = statusLabelFi(status);
       return `<div class="card">
-        <div class="line">${escapeHtml(s.home ?? 'Koti')} ${escapeHtml(String(s.scoreHome ?? 0))} – ${escapeHtml(String(s.scoreAway ?? 0))} ${escapeHtml(s.away ?? 'Vieras')}</div>
-        <div class="meta" data-status="${escapeHtml(status)}"></div>
-        <a href="/share/${encodeURIComponent(s.matchId)}" class="open-match-link">Avaa ottelu</a>
+        <div class="line">${escapeHtml(s.home ?? 'Koti')} ${Number(s.scoreHome ?? 0)} – ${Number(s.scoreAway ?? 0)} ${escapeHtml(s.away ?? 'Vieras')}</div>
+        <div class="meta">${escapeHtml(statusFi)}</div>
+        <a href="/share/${encodeURIComponent(s.matchId)}">Avaa ottelu</a>
       </div>`;
     }).join('')}
   </div>
-
-  ${renderSharedClientHelpers(`
-    function applyPageLanguage() {
-      const lang = getCurrentLang();
-      const dict = getDictionary(lang);
-
-      document.title = dict.selectMatch;
-      document.getElementById('selectionTitle').textContent = dict.selectMatch;
-      document.getElementById('selectionHint').textContent = dict.multiMatches;
-
-      document.querySelectorAll('[data-status]').forEach(function (el) {
-        el.textContent = getStatusText(el.dataset.status, lang);
-      });
-
-      document.querySelectorAll('.open-match-link').forEach(function (el) {
-        el.textContent = dict.openMatch;
-      });
-    }
-
-    wireLanguageButtons(applyPageLanguage);
-  `)}
 </body>
 </html>`;
 
@@ -673,17 +784,11 @@ function renderSelectionPage(res, tokenMatches) {
 }
 
 // POST snapshot from app
-app.post('/api/snapshot', (req, res) => {
-  const auth = req.headers.authorization || '';
-  const m = auth.match(/^Bearer\s+(.*)$/i);
+app.post('/api/snapshot', asyncHandler(async (req, res) => {
+  const token = getBearerToken(req);
 
-  if (!m) {
-    return res.status(401).json({ error: 'Unauthorized: missing or invalid token' });
-  }
-
-  const token = String(m[1] || '').trim();
   if (!token) {
-    return res.status(401).json({ error: 'Unauthorized: empty token' });
+    return res.status(401).json({ error: 'Unauthorized: missing or invalid token' });
   }
 
   const body = req.body || {};
@@ -696,12 +801,7 @@ app.post('/api/snapshot', (req, res) => {
     });
   }
 
-  // Prefer client-provided MatchID (header or body), fallback to slug
-  const headerMatchId = String(req.headers['x-match-id'] || req.headers['x-matchid'] || '').trim();
-  const bodyMatchId = String(body.matchID || body.matchId || '').trim();
-  const providedMatchId = headerMatchId || bodyMatchId;
-
-  const matchId = providedMatchId || buildMatchId({ ...body, home, away });
+  const matchId = pickIncomingMatchId(req, { ...body, home, away });
   const nowISO = new Date().toISOString();
 
   const prev = matches.get(matchId) || {};
@@ -725,13 +825,20 @@ app.post('/api/snapshot', (req, res) => {
 
   attachMatchToToken(token, matchId);
 
+  const status = getStatus(record);
+  if (status === 'final' || record.isEnded) {
+    await upsertFinalResult({
+      ...record,
+      status: 'final',
+      isEnded: true
+    });
+  }
+
   console.log('SNAPSHOT IN', {
     token,
     home,
     away,
-    matchId,
-    providedMatchId,
-    headerMatchId
+    matchId
   });
 
   res.set('Cache-Control', 'no-store');
@@ -739,23 +846,28 @@ app.post('/api/snapshot', (req, res) => {
     ok: true,
     token,
     matchId,
-    shareUrl: '/share/' + matchId,
-    tokenShareUrl: '/share/' + token,
+    shareUrl: `/share/${matchId}`,
+    tokenShareUrl: `/share/${token}`,
     updatedAt: nowISO
   });
-});
+}));
 
 // GET snapshot JSON by identifier
-app.get('/api/snapshot/:id', (req, res) => {
+app.get('/api/snapshot/:id', asyncHandler(async (req, res) => {
   const id = String(req.params.id || '').trim();
 
   if (matches.has(id)) {
     const rec = matches.get(id);
-    if (!rec || !isFresh(rec)) {
-      return res.status(404).json({ error: 'Snapshot not found' });
+    if (rec && isFresh(rec)) {
+      res.set('Cache-Control', 'no-store');
+      return res.json(rec);
     }
+  }
+
+  const persisted = await getPersistedFinalByMatchId(id);
+  if (persisted) {
     res.set('Cache-Control', 'no-store');
-    return res.json(rec);
+    return res.json(persisted);
   }
 
   const tokenMatches = getMatchesForToken(id);
@@ -781,20 +893,27 @@ app.get('/api/snapshot/:id', (req, res) => {
   }
 
   return res.status(404).json({ error: 'Snapshot not found' });
-});
+}));
 
 // GET snapshot JSON by query parameter (?matchId=... or ?token=...)
-app.get('/api/snapshot', (req, res) => {
+app.get('/api/snapshot', asyncHandler(async (req, res) => {
   const matchId = String(req.query.matchId || '').trim();
   const token = String(req.query.token || '').trim();
 
   if (matchId) {
     const rec = matches.get(matchId);
-    if (!rec || !isFresh(rec)) {
-      return res.status(404).json({ error: 'Snapshot not found' });
+    if (rec && isFresh(rec)) {
+      res.set('Cache-Control', 'no-store');
+      return res.json(rec);
     }
-    res.set('Cache-Control', 'no-store');
-    return res.json(rec);
+
+    const persisted = await getPersistedFinalByMatchId(matchId);
+    if (persisted) {
+      res.set('Cache-Control', 'no-store');
+      return res.json(persisted);
+    }
+
+    return res.status(404).json({ error: 'Snapshot not found' });
   }
 
   if (token) {
@@ -822,23 +941,40 @@ app.get('/api/snapshot', (req, res) => {
   }
 
   return res.status(404).json({ error: 'Snapshot not found' });
-});
+}));
 
 // Alias JSON endpoint
-app.get('/api/share/:id', (req, res) => {
-  const rec = getMatchByIdentifier(req.params.id || '');
-  if (!rec) {
-    return res.status(404).json({ error: 'Snapshot not found' });
-  }
-  res.set('Cache-Control', 'no-store');
-  res.json(rec);
-});
+app.get('/api/share/:id', asyncHandler(async (req, res) => {
+  const id = String(req.params.id || '').trim();
 
-app.get('/api/list', (req, res) => {
-  const items = listFreshMatches();
+  if (matches.has(id)) {
+    const rec = matches.get(id);
+    if (rec && isFresh(rec)) {
+      res.set('Cache-Control', 'no-store');
+      return res.json(rec);
+    }
+  }
+
+  const persisted = await getPersistedFinalByMatchId(id);
+  if (persisted) {
+    res.set('Cache-Control', 'no-store');
+    return res.json(persisted);
+  }
+
+  const tokenMatches = getMatchesForToken(id);
+  if (tokenMatches.length === 1) {
+    res.set('Cache-Control', 'no-store');
+    return res.json(tokenMatches[0]);
+  }
+
+  return res.status(404).json({ error: 'Snapshot not found' });
+}));
+
+app.get('/api/list', asyncHandler(async (req, res) => {
+  const items = await listVisibleMatches();
   res.set('Cache-Control', 'no-store');
   res.json({ ttlMs: TTL_MS, nowISO: new Date().toISOString(), items });
-});
+}));
 
 app.get('/', (req, res) => {
   res.redirect(302, '/list');
@@ -849,134 +985,271 @@ app.get('/health', (req, res) => {
 });
 
 // Share page
-app.get('/share/:id', (req, res) => {
+app.get('/share/:id', asyncHandler(async (req, res) => {
   const id = String(req.params.id || '').trim();
 
-  // Direct matchId
   if (matches.has(id)) {
     const rec = matches.get(id);
-    if (!rec || !isFresh(rec)) {
-      return renderNoMatchesPage(res);
+    if (rec && isFresh(rec)) {
+      return renderSharePage(res, rec, id);
     }
-    return renderSharePage(res, rec, id);
   }
 
-  // Token
+  const persisted = await getPersistedFinalByMatchId(id);
+  if (persisted) {
+    return renderSharePage(res, persisted, id);
+  }
+
   const tokenMatches = getMatchesForToken(id);
 
   if (tokenMatches.length === 0) {
-    return renderNoMatchesPage(res);
+    return res.status(404).send('Snapshot not found');
   }
 
   if (tokenMatches.length === 1) {
     return renderSharePage(res, tokenMatches[0], id);
   }
 
-  return renderSelectionPage(res, tokenMatches);
-});
+  return renderTokenSelectionPage(res, tokenMatches);
+}));
 
 // List page
-app.get('/list', (req, res) => {
-  const items = listFreshMatches();
+app.get('/list', asyncHandler(async (req, res) => {
+  const items = await listVisibleMatches();
 
   const html = `<!doctype html>
 <html lang="fi">
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Liveseuranta – ottelut</title>
+  <title>Liveseuranta – Ottelulista</title>
   <meta http-equiv="refresh" content="15" />
   <style>
-    body { margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; background: #f7f8fa; color: #111; }
-    .wrap { max-width: 980px; margin: 20px auto; padding: 0 16px; }
-    .topbar { display: flex; justify-content: flex-end; margin-bottom: 12px; }
-    .lang-switch { display: inline-flex; gap: 8px; }
-    .lang-btn { border: 1px solid rgba(0,0,0,0.12); background: #fff; border-radius: 10px; padding: 8px 10px; cursor: pointer; font-size: 13px; }
-    .lang-btn.active { background: #111; color: #fff; }
-    h1 { font-size: 22px; margin: 6px 0 12px; }
-    .hint { color: #666; font-size: 13px; margin-bottom: 12px; }
-    table { width: 100%; border-collapse: collapse; background: rgba(255,255,255,0.9); border: 1px solid rgba(0,0,0,0.08); border-radius: 12px; overflow: hidden; }
-    th, td { padding: 10px 12px; border-bottom: 1px solid rgba(0,0,0,0.06); font-size: 14px; vertical-align: top; }
-    th { background: rgba(0,0,0,0.04); text-align: left; }
-    tr:last-child td { border-bottom: none; }
-    .status { font-size: 12px; color: #666; }
-    .links a { font-size: 13px; color: #0a58ca; text-decoration: none; }
-    .empty { padding: 16px; color: #666; background: rgba(255,255,255,0.9); border: 1px solid rgba(0,0,0,0.08); border-radius: 12px; }
+    body {
+      margin: 0;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      background: #f7f8fa;
+      color: #111;
+    }
+    .wrap {
+      max-width: 980px;
+      margin: 20px auto;
+      padding: 0 16px;
+    }
+    h1 {
+      font-size: 22px;
+      margin: 6px 0 12px;
+    }
+    .hint {
+      color: #666;
+      font-size: 13px;
+      margin-bottom: 12px;
+    }
+    .footer-link {
+      margin-top: 14px;
+      font-size: 14px;
+    }
+    .footer-link a {
+      color: #0A66FF;
+      text-decoration: none;
+      font-weight: 600;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      background: rgba(255,255,255,0.9);
+      border: 1px solid rgba(0,0,0,0.08);
+      border-radius: 12px;
+      overflow: hidden;
+    }
+    th, td {
+      padding: 10px 12px;
+      border-bottom: 1px solid rgba(0,0,0,0.06);
+      font-size: 14px;
+      vertical-align: top;
+    }
+    th {
+      background: rgba(0,0,0,0.04);
+      text-align: left;
+    }
+    tr:last-child td {
+      border-bottom: none;
+    }
+    .status {
+      font-size: 12px;
+      color: #666;
+    }
+    .links a {
+      font-size: 13px;
+      color: #0A66FF;
+      text-decoration: none;
+      font-weight: 600;
+    }
+    .empty {
+      padding: 12px 0;
+      color: #666;
+    }
   </style>
 </head>
 <body>
   <div class="wrap">
-    ${renderLangSwitcher()}
-    <h1 id="listTitle">Liveseuranta – ottelut (${items.length})</h1>
-    <div class="hint" id="listHint">Näytetään ottelut, joita on päivitetty viimeisen ${TTL_DAYS} päivän aikana.</div>
+    <h1>Liveseuranta – ottelut (${items.length})</h1>
+    <div class="hint">Näytetään aktiiviset ottelut sekä tallennetut lopputulokset.</div>
+
     ${
       items.length === 0
-        ? '<div class="empty" id="emptyText">Otteluseurannassa ei ole käynnissä olevia otteluita.</div>'
+        ? '<div class="empty">Otteluseurannassa ei ole käynnissä olevia otteluita eikä tallennettuja lopputuloksia.</div>'
         : `<table>
             <thead>
               <tr>
-                <th id="thMatch">Ottelu</th>
-                <th id="thScore">Tulos</th>
-                <th id="thStatus">Status</th>
-                <th id="thLinks">Linkki</th>
+                <th>Ottelu</th>
+                <th>Tulos</th>
+                <th>Status</th>
+                <th>Päivitetty</th>
+                <th>Linkki</th>
               </tr>
             </thead>
             <tbody>
               ${items.map((i) => {
-                const score = String(i.scoreHome ?? 0) + ' – ' + String(i.scoreAway ?? 0);
+                const d = new Date(i.updatedAt);
+                const dateStr = d.toLocaleString('fi-FI', {
+                  dateStyle: 'short',
+                  timeStyle: 'medium'
+                });
+                const score = `${Number(i.scoreHome ?? 0)} – ${Number(i.scoreAway ?? 0)}`;
+                const statusFi = statusLabelFi(i.status);
                 const mid = encodeURIComponent(i.matchId);
 
                 return `<tr>
                   <td>${escapeHtml(i.home)} – ${escapeHtml(i.away)}</td>
-                  <td>${escapeHtml(score)}</td>
-                  <td class="status" data-status="${escapeHtml(i.status)}"></td>
+                  <td>${score}</td>
+                  <td class="status">${escapeHtml(statusFi)}</td>
+                  <td class="status">${escapeHtml(dateStr)}</td>
                   <td class="links">
-                    <a href="/share/${mid}" class="share-link">Seurantasivulle</a>
+                    <a href="/share/${mid}">Seurantasivulle</a>
                   </td>
                 </tr>`;
               }).join('')}
             </tbody>
           </table>`
     }
+
+    <div class="footer-link">
+      <a href="/privacy">Tietosuojaseloste</a>
+    </div>
   </div>
+</body>
+</html>`;
 
-  ${renderSharedClientHelpers(`
-    const count = ${JSON.stringify(items.length)};
+  res.setHeader('Content-Type', 'text/html; charset=utf-8');
+  res.setHeader('Cache-Control', 'no-store');
+  res.send(html);
+}));
 
-    function applyPageLanguage() {
-      const lang = getCurrentLang();
-      const dict = getDictionary(lang);
-
-      document.title = dict.listTitle;
-      document.getElementById('listTitle').textContent = dict.listTitle + ' (' + count + ')';
-      document.getElementById('listHint').textContent = formatText(dict.daysHint, { days: TTL_DAYS });
-
-      const empty = document.getElementById('emptyText');
-      if (empty) {
-        empty.textContent = dict.noMatches;
-      }
-
-      const thMatch = document.getElementById('thMatch');
-      const thScore = document.getElementById('thScore');
-      const thStatus = document.getElementById('thStatus');
-      const thLinks = document.getElementById('thLinks');
-
-      if (thMatch) thMatch.textContent = dict.match;
-      if (thScore) thScore.textContent = dict.score;
-      if (thStatus) thStatus.textContent = dict.status;
-      if (thLinks) thLinks.textContent = dict.links;
-
-      document.querySelectorAll('[data-status]').forEach(function (el) {
-        el.textContent = getStatusText(el.dataset.status, lang);
-      });
-
-      document.querySelectorAll('.share-link').forEach(function (el) {
-        el.textContent = dict.sharePage;
-      });
+// Privacy Policy
+app.get('/privacy', (req, res) => {
+  const html = `<!doctype html>
+<html lang="fi">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Tietosuojaseloste</title>
+  <style>
+    body {
+      margin: 0;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      background: #f7f8fa;
+      color: #111;
+      line-height: 1.65;
     }
+    .wrap {
+      max-width: 860px;
+      margin: 32px auto;
+      padding: 0 16px 40px;
+    }
+    .card {
+      background: #fff;
+      border: 1px solid rgba(0,0,0,0.08);
+      border-radius: 16px;
+      padding: 24px;
+    }
+    h1 {
+      margin-top: 0;
+      font-size: 28px;
+    }
+    h2 {
+      margin-top: 28px;
+      font-size: 20px;
+    }
+    p, li {
+      font-size: 15px;
+      color: #222;
+    }
+    .muted {
+      color: #666;
+      font-size: 14px;
+    }
+    a {
+      color: #0A66FF;
+      text-decoration: none;
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="card">
+      <h1>Tietosuojaseloste</h1>
+      <p class="muted">Viimeksi päivitetty: ${new Date().toISOString().slice(0, 10)}</p>
 
-    wireLanguageButtons(applyPageLanguage);
-  `)}
+      <p>
+        Tämä tietosuojaseloste koskee tätä live-seurantasovellusta ja siihen liittyvää verkkopalvelua.
+      </p>
+
+      <h2>1. Mitä tietoja sovellus käsittelee</h2>
+      <p>
+        Sovellus käsittelee vain otteluiden live-seurantaan liittyviä teknisiä ja sisällöllisiä tietoja,
+        kuten joukkueiden nimet, tulokset, ottelun tilatiedot ja muut ottelutapahtumatiedot.
+      </p>
+
+      <h2>2. Henkilötiedot</h2>
+      <p>
+        Sovellus ei kerää, tallenna eikä käsittele henkilötietoja. Sovelluksessa ei ole käyttäjätilien
+        luontia, kirjautumista eikä käyttäjäprofiileja.
+      </p>
+
+      <h2>3. Analytiikka ja seuranta</h2>
+      <p>
+        Sovellus ei käytä analytiikkaa, mainosseurantaa eikä muita käyttäjän käyttäytymistä seuraavia työkaluja.
+      </p>
+
+      <h2>4. Tietojen käyttötarkoitus</h2>
+      <p>
+        Käsiteltäviä tietoja käytetään ainoastaan sovelluksen ydintoimintojen toteuttamiseen, kuten
+        live-otteluseurannan näyttämiseen ja otteluiden lopputulosten tallentamiseen.
+      </p>
+
+      <h2>5. Tietojen luovutus</h2>
+      <p>
+        Tietoja ei myydä eikä luovuteta kolmansille osapuolille muussa tarkoituksessa. Tietoja voidaan
+        käsitellä vain siinä laajuudessa kuin palvelun tekninen ylläpito sitä edellyttää.
+      </p>
+
+      <h2>6. Tietoturva</h2>
+      <p>
+        Palvelun toiminnassa pyritään käyttämään asianmukaisia teknisiä ja organisatorisia suojatoimia.
+      </p>
+
+      <h2>7. Yhteydenotot</h2>
+      <p>
+        Jos sinulla on kysyttävää tästä tietosuojaselosteesta, voit ottaa yhteyttä sähköpostitse:
+        <a href="mailto:johannes.rimpilainen@leasegreen.com">johannes.rimpilainen@leasegreen.com</a>
+      </p>
+
+      <p>
+        <a href="/list">← Takaisin ottelulistaan</a>
+      </p>
+    </div>
+  </div>
 </body>
 </html>`;
 
@@ -985,9 +1258,66 @@ app.get('/list', (req, res) => {
   res.send(html);
 });
 
+// Admin: list persisted finals
+app.get('/api/admin/finals', requireAdmin, asyncHandler(async (req, res) => {
+  const items = await listPersistedFinals();
+  res.set('Cache-Control', 'no-store');
+  res.json({ items });
+}));
+
+// Admin: delete persisted final
+app.delete('/api/admin/finals/:matchId', requireAdmin, asyncHandler(async (req, res) => {
+  const matchId = String(req.params.matchId || '').trim();
+
+  if (!matchId) {
+    return res.status(400).json({ error: 'Missing matchId' });
+  }
+
+  const existing = await getPersistedFinalByMatchId(matchId);
+  if (!existing) {
+    return res.status(404).json({ error: 'Final result not found' });
+  }
+
+  const result = await softDeleteFinal(matchId);
+
+  const liveRec = matches.get(matchId);
+  if (liveRec && (getStatus(liveRec) === 'final' || liveRec.isEnded)) {
+    matches.delete(matchId);
+    if (liveRec.token) {
+      removeMatchFromToken(String(liveRec.token), matchId);
+    }
+  }
+
+  res.set('Cache-Control', 'no-store');
+  res.json({
+    ok: true,
+    matchId,
+    deletedAt: result.deletedAt
+  });
+}));
+
 app.use(express.static(path.join(__dirname, 'public')));
 
-const PORT = process.env.PORT || 10000;
-app.listen(PORT, () => {
-  console.log('Server listening on port ' + PORT);
+app.use((err, req, res, next) => {
+  console.error('Unhandled error', err);
+
+  if (res.headersSent) {
+    return next(err);
+  }
+
+  res.status(500).json({ error: 'Internal server error' });
 });
+
+const PORT = process.env.PORT || 10000;
+
+initDb()
+  .then(() => {
+    app.listen(PORT, () => {
+      console.log(`Server listening on port ${PORT}`);
+      console.log(`Final results DB: ${FINAL_DB_PATH}`);
+    });
+  })
+  .catch((err) => {
+    console.error('Failed to initialize database', err);
+    process.exit(1);
+  });
