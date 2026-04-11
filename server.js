@@ -2,93 +2,29 @@
 
 const express = require('express');
 const path = require('path');
-const fs = require('fs');
-const sqlite3 = require('sqlite3').verbose();
 
 const app = express();
 app.use(express.json({ limit: '1mb' }));
 
-// In-memory live matches
 // matchId -> latest snapshot
 const matches = new Map();
 
 // token -> Set of matchIds
 const tokenToMatchIds = new Map();
 
-// Live visibility TTL
-const TTL_DAYS = Number(process.env.LIVE_TTL_DAYS || 7);
-const TTL_MS = Number(process.env.LIVE_TTL_MS || TTL_DAYS * 24 * 60 * 60 * 1000);
+// Live matches default to 7 days
+const LIVE_TTL_DAYS = Number(process.env.LIVE_TTL_DAYS || 7);
+const LIVE_TTL_MS = Number(
+  process.env.LIVE_TTL_MS || LIVE_TTL_DAYS * 24 * 60 * 60 * 1000
+);
 
-// Persistent final results
-const FINAL_DB_PATH =
-  process.env.FINAL_DB_PATH || path.join(__dirname, 'data', 'final-results.sqlite');
+// Final matches default to 365 days in memory while process stays up
+const FINAL_TTL_DAYS = Number(process.env.FINAL_TTL_DAYS || 365);
+const FINAL_TTL_MS = Number(
+  process.env.FINAL_TTL_MS || FINAL_TTL_DAYS * 24 * 60 * 60 * 1000
+);
 
 const ADMIN_TOKEN = String(process.env.ADMIN_TOKEN || '').trim();
-
-fs.mkdirSync(path.dirname(FINAL_DB_PATH), { recursive: true });
-
-const db = new sqlite3.Database(FINAL_DB_PATH);
-
-function dbRun(sql, params = []) {
-  return new Promise((resolve, reject) => {
-    db.run(sql, params, function onRun(err) {
-      if (err) return reject(err);
-      resolve(this);
-    });
-  });
-}
-
-function dbGet(sql, params = []) {
-  return new Promise((resolve, reject) => {
-    db.get(sql, params, (err, row) => {
-      if (err) return reject(err);
-      resolve(row || null);
-    });
-  });
-}
-
-function dbAll(sql, params = []) {
-  return new Promise((resolve, reject) => {
-    db.all(sql, params, (err, rows) => {
-      if (err) return reject(err);
-      resolve(rows || []);
-    });
-  });
-}
-
-async function initDb() {
-  await dbRun(`
-    CREATE TABLE IF NOT EXISTS final_results (
-      match_id TEXT PRIMARY KEY,
-      token TEXT,
-      home TEXT NOT NULL,
-      away TEXT NOT NULL,
-      score_home INTEGER NOT NULL DEFAULT 0,
-      score_away INTEGER NOT NULL DEFAULT 0,
-      status TEXT NOT NULL,
-      snapshot_json TEXT NOT NULL,
-      updated_at TEXT NOT NULL,
-      created_at TEXT NOT NULL,
-      deleted_at TEXT
-    )
-  `);
-
-  await dbRun(`
-    CREATE INDEX IF NOT EXISTS idx_final_results_updated_at
-    ON final_results(updated_at DESC)
-  `);
-
-  await dbRun(`
-    CREATE INDEX IF NOT EXISTS idx_final_results_deleted_at
-    ON final_results(deleted_at)
-  `);
-}
-
-function asyncHandler(fn) {
-  return (req, res, next) => {
-    Promise.resolve(fn(req, res, next)).catch(next);
-  };
-}
 
 function escapeHtml(value = '') {
   return String(value)
@@ -121,6 +57,27 @@ function pickIncomingMatchId(req, body = {}) {
   const headerMatchId = String(req.headers['x-match-id'] || '').trim();
 
   return bodyMatchId || bodyMatchID || headerMatchId || buildMatchId(body);
+}
+
+function getStatus(rec = {}) {
+  return rec.status || (rec.isEnded ? 'final' : (rec.isPaused ? 'paused' : 'live'));
+}
+
+function getStatusLabelFi(status) {
+  if (status === 'final') return 'Lopputulos';
+  if (status === 'paused') return 'Tauko';
+  return 'Käynnissä';
+}
+
+function getTtlForRecord(rec = {}) {
+  return getStatus(rec) === 'final' ? FINAL_TTL_MS : LIVE_TTL_MS;
+}
+
+function isFresh(rec) {
+  if (!rec || !rec.updatedAt) return false;
+  const t = Date.parse(rec.updatedAt);
+  if (Number.isNaN(t)) return false;
+  return (Date.now() - t) < getTtlForRecord(rec);
 }
 
 function pickPossession(obj = {}) {
@@ -158,21 +115,24 @@ function pickPossession(obj = {}) {
   return { h, a };
 }
 
-function getStatus(rec = {}) {
-  return rec.status || (rec.isEnded ? 'final' : (rec.isPaused ? 'paused' : 'live'));
+function getBearerToken(req) {
+  const auth = req.headers.authorization || '';
+  const m = auth.match(/^Bearer\s+(.*)$/i);
+  if (!m) return '';
+  return String(m[1] || '').trim();
 }
 
-function statusLabelFi(status) {
-  if (status === 'final') return 'Lopputulos';
-  if (status === 'paused') return 'Tauko';
-  return 'Käynnissä';
-}
+function requireAdmin(req, res, next) {
+  if (!ADMIN_TOKEN) {
+    return res.status(500).json({ error: 'ADMIN_TOKEN is not configured' });
+  }
 
-function isFresh(rec) {
-  if (!rec || !rec.updatedAt) return false;
-  const t = Date.parse(rec.updatedAt);
-  if (Number.isNaN(t)) return false;
-  return (Date.now() - t) < TTL_MS;
+  const token = getBearerToken(req);
+  if (!token || token !== ADMIN_TOKEN) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+
+  next();
 }
 
 function attachMatchToToken(token, matchId) {
@@ -237,186 +197,22 @@ function listFreshMatches() {
   return items;
 }
 
-function getBearerToken(req) {
-  const auth = req.headers.authorization || '';
-  const m = auth.match(/^Bearer\s+(.*)$/i);
-  if (!m) return '';
-  return String(m[1] || '').trim();
-}
+function deleteMatch(matchId) {
+  const rec = matches.get(matchId);
+  if (!rec) return false;
 
-function requireAdmin(req, res, next) {
-  if (!ADMIN_TOKEN) {
-    return res.status(500).json({ error: 'ADMIN_TOKEN is not configured' });
+  matches.delete(matchId);
+  if (rec.token) {
+    removeMatchFromToken(String(rec.token), matchId);
   }
-
-  const token = getBearerToken(req);
-  if (!token || token !== ADMIN_TOKEN) {
-    return res.status(401).json({ error: 'Unauthorized' });
-  }
-
-  next();
+  return true;
 }
 
-function rowToRecord(row) {
-  if (!row) return null;
-
-  let snapshot = {};
-  try {
-    snapshot = JSON.parse(row.snapshot_json || '{}');
-  } catch (e) {
-    snapshot = {};
-  }
-
-  return {
-    ...snapshot,
-    token: row.token || snapshot.token || '',
-    matchId: row.match_id,
-    home: row.home,
-    away: row.away,
-    scoreHome: row.score_home ?? snapshot.scoreHome ?? 0,
-    scoreAway: row.score_away ?? snapshot.scoreAway ?? 0,
-    status: row.status || snapshot.status || 'final',
-    isEnded: true,
-    updatedAt: row.updated_at
-  };
-}
-
-async function upsertFinalResult(rec) {
-  const nowISO = new Date().toISOString();
-
-  await dbRun(
-    `
-    INSERT INTO final_results (
-      match_id,
-      token,
-      home,
-      away,
-      score_home,
-      score_away,
-      status,
-      snapshot_json,
-      updated_at,
-      created_at,
-      deleted_at
-    )
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
-    ON CONFLICT(match_id) DO UPDATE SET
-      token = excluded.token,
-      home = excluded.home,
-      away = excluded.away,
-      score_home = excluded.score_home,
-      score_away = excluded.score_away,
-      status = excluded.status,
-      snapshot_json = excluded.snapshot_json,
-      updated_at = excluded.updated_at,
-      deleted_at = NULL
-    `,
-    [
-      rec.matchId,
-      rec.token || '',
-      rec.home || 'Koti',
-      rec.away || 'Vieras',
-      Number(rec.scoreHome ?? 0),
-      Number(rec.scoreAway ?? 0),
-      'final',
-      JSON.stringify({ ...rec, status: 'final', isEnded: true }),
-      rec.updatedAt || nowISO,
-      nowISO
-    ]
-  );
-}
-
-async function getPersistedFinalByMatchId(matchId) {
-  const row = await dbGet(
-    `
-    SELECT *
-    FROM final_results
-    WHERE match_id = ?
-      AND deleted_at IS NULL
-    LIMIT 1
-    `,
-    [matchId]
-  );
-
-  return rowToRecord(row);
-}
-
-async function listPersistedFinals() {
-  const rows = await dbAll(
-    `
-    SELECT
-      match_id,
-      token,
-      home,
-      away,
-      score_home,
-      score_away,
-      status,
-      updated_at
-    FROM final_results
-    WHERE deleted_at IS NULL
-    ORDER BY datetime(updated_at) DESC
-    `
-  );
-
-  return rows.map((row) => ({
-    matchId: row.match_id,
-    token: row.token || '',
-    home: row.home || 'Koti',
-    away: row.away || 'Vieras',
-    scoreHome: row.score_home ?? 0,
-    scoreAway: row.score_away ?? 0,
-    status: row.status || 'final',
-    updatedAt: row.updated_at
-  }));
-}
-
-async function listVisibleMatches() {
-  const liveItems = listFreshMatches();
-  const persistedItems = await listPersistedFinals();
-
-  const byId = new Map();
-
-  for (const item of persistedItems) {
-    byId.set(item.matchId, item);
-  }
-
-  for (const item of liveItems) {
-    byId.set(item.matchId, item);
-  }
-
-  return Array.from(byId.values()).sort(
-    (a, b) => Date.parse(b.updatedAt) - Date.parse(a.updatedAt)
-  );
-}
-
-async function softDeleteFinal(matchId) {
-  const deletedAt = new Date().toISOString();
-
-  const result = await dbRun(
-    `
-    UPDATE final_results
-    SET deleted_at = ?
-    WHERE match_id = ?
-      AND deleted_at IS NULL
-    `,
-    [deletedAt, matchId]
-  );
-
-  return {
-    changed: result.changes > 0,
-    deletedAt
-  };
-}
-
-// Cleanup old live matches every 15 min
+// Cleanup old matches every 15 min
 setInterval(() => {
   for (const [matchId, rec] of matches.entries()) {
     if (!isFresh(rec)) {
-      matches.delete(matchId);
-      if (rec && rec.token) {
-        removeMatchFromToken(rec.token, matchId);
-      }
+      deleteMatch(matchId);
     }
   }
 
@@ -461,7 +257,7 @@ function renderSharePage(res, s, originalId) {
 <title>Liveseuranta – ${escapeHtml(homeName)} vs ${escapeHtml(awayName)}</title>
 <style>
   :root {
-    --glass-bg: rgba(255,255,255,0.7);
+    --glass-bg: rgba(255,255,255,0.75);
     --glass-border: rgba(0,0,0,0.08);
     --text: #111;
     --subtle: #666;
@@ -487,6 +283,11 @@ function renderSharePage(res, s, originalId) {
     text-decoration: none;
     font-size: 14px;
     font-weight: 600;
+  }
+  .note {
+    margin-top: 6px;
+    color: var(--subtle);
+    font-size: 12px;
   }
   .card {
     background: var(--glass-bg);
@@ -579,6 +380,7 @@ function renderSharePage(res, s, originalId) {
   <div class="container" role="main" aria-label="Match Quick Stats">
     <div class="topbar">
       <a href="/list">← Takaisin ottelulistaan</a>
+      <div class="note">Muistissa säilytys: palvelun restart tai deploy tyhjentää ottelut.</div>
     </div>
 
     <div class="card">
@@ -766,8 +568,7 @@ function renderTokenSelectionPage(res, tokenMatches) {
     <h1>Valitse ottelu</h1>
     <div class="hint">Tällä tokenilla on useita aktiivisia otteluita.</div>
     ${tokenMatches.map((s) => {
-      const status = getStatus(s);
-      const statusFi = statusLabelFi(status);
+      const statusFi = getStatusLabelFi(getStatus(s));
       return `<div class="card">
         <div class="line">${escapeHtml(s.home ?? 'Koti')} ${Number(s.scoreHome ?? 0)} – ${Number(s.scoreAway ?? 0)} ${escapeHtml(s.away ?? 'Vieras')}</div>
         <div class="meta">${escapeHtml(statusFi)}</div>
@@ -784,7 +585,7 @@ function renderTokenSelectionPage(res, tokenMatches) {
 }
 
 // POST snapshot from app
-app.post('/api/snapshot', asyncHandler(async (req, res) => {
+app.post('/api/snapshot', (req, res) => {
   const token = getBearerToken(req);
 
   if (!token) {
@@ -825,20 +626,12 @@ app.post('/api/snapshot', asyncHandler(async (req, res) => {
 
   attachMatchToToken(token, matchId);
 
-  const status = getStatus(record);
-  if (status === 'final' || record.isEnded) {
-    await upsertFinalResult({
-      ...record,
-      status: 'final',
-      isEnded: true
-    });
-  }
-
   console.log('SNAPSHOT IN', {
     token,
     home,
     away,
-    matchId
+    matchId,
+    status: getStatus(record)
   });
 
   res.set('Cache-Control', 'no-store');
@@ -850,24 +643,19 @@ app.post('/api/snapshot', asyncHandler(async (req, res) => {
     tokenShareUrl: `/share/${token}`,
     updatedAt: nowISO
   });
-}));
+});
 
 // GET snapshot JSON by identifier
-app.get('/api/snapshot/:id', asyncHandler(async (req, res) => {
+app.get('/api/snapshot/:id', (req, res) => {
   const id = String(req.params.id || '').trim();
 
   if (matches.has(id)) {
     const rec = matches.get(id);
-    if (rec && isFresh(rec)) {
-      res.set('Cache-Control', 'no-store');
-      return res.json(rec);
+    if (!rec || !isFresh(rec)) {
+      return res.status(404).json({ error: 'Snapshot not found' });
     }
-  }
-
-  const persisted = await getPersistedFinalByMatchId(id);
-  if (persisted) {
     res.set('Cache-Control', 'no-store');
-    return res.json(persisted);
+    return res.json(rec);
   }
 
   const tokenMatches = getMatchesForToken(id);
@@ -893,27 +681,20 @@ app.get('/api/snapshot/:id', asyncHandler(async (req, res) => {
   }
 
   return res.status(404).json({ error: 'Snapshot not found' });
-}));
+});
 
 // GET snapshot JSON by query parameter (?matchId=... or ?token=...)
-app.get('/api/snapshot', asyncHandler(async (req, res) => {
+app.get('/api/snapshot', (req, res) => {
   const matchId = String(req.query.matchId || '').trim();
   const token = String(req.query.token || '').trim();
 
   if (matchId) {
     const rec = matches.get(matchId);
-    if (rec && isFresh(rec)) {
-      res.set('Cache-Control', 'no-store');
-      return res.json(rec);
+    if (!rec || !isFresh(rec)) {
+      return res.status(404).json({ error: 'Snapshot not found' });
     }
-
-    const persisted = await getPersistedFinalByMatchId(matchId);
-    if (persisted) {
-      res.set('Cache-Control', 'no-store');
-      return res.json(persisted);
-    }
-
-    return res.status(404).json({ error: 'Snapshot not found' });
+    res.set('Cache-Control', 'no-store');
+    return res.json(rec);
   }
 
   if (token) {
@@ -941,24 +722,19 @@ app.get('/api/snapshot', asyncHandler(async (req, res) => {
   }
 
   return res.status(404).json({ error: 'Snapshot not found' });
-}));
+});
 
 // Alias JSON endpoint
-app.get('/api/share/:id', asyncHandler(async (req, res) => {
+app.get('/api/share/:id', (req, res) => {
   const id = String(req.params.id || '').trim();
 
   if (matches.has(id)) {
     const rec = matches.get(id);
-    if (rec && isFresh(rec)) {
-      res.set('Cache-Control', 'no-store');
-      return res.json(rec);
+    if (!rec || !isFresh(rec)) {
+      return res.status(404).json({ error: 'Snapshot not found' });
     }
-  }
-
-  const persisted = await getPersistedFinalByMatchId(id);
-  if (persisted) {
     res.set('Cache-Control', 'no-store');
-    return res.json(persisted);
+    return res.json(rec);
   }
 
   const tokenMatches = getMatchesForToken(id);
@@ -967,14 +743,34 @@ app.get('/api/share/:id', asyncHandler(async (req, res) => {
     return res.json(tokenMatches[0]);
   }
 
-  return res.status(404).json({ error: 'Snapshot not found' });
-}));
+  if (tokenMatches.length > 1) {
+    return res.status(409).json({
+      error: 'Multiple matches found for token',
+      items: tokenMatches.map((m) => ({
+        matchId: m.matchId,
+        home: m.home || 'Koti',
+        away: m.away || 'Vieras',
+        scoreHome: m.scoreHome ?? 0,
+        scoreAway: m.scoreAway ?? 0,
+        status: getStatus(m),
+        updatedAt: m.updatedAt
+      }))
+    });
+  }
 
-app.get('/api/list', asyncHandler(async (req, res) => {
-  const items = await listVisibleMatches();
+  return res.status(404).json({ error: 'Snapshot not found' });
+});
+
+app.get('/api/list', (req, res) => {
+  const items = listFreshMatches();
   res.set('Cache-Control', 'no-store');
-  res.json({ ttlMs: TTL_MS, nowISO: new Date().toISOString(), items });
-}));
+  res.json({
+    liveTtlMs: LIVE_TTL_MS,
+    finalTtlMs: FINAL_TTL_MS,
+    nowISO: new Date().toISOString(),
+    items
+  });
+});
 
 app.get('/', (req, res) => {
   res.redirect(302, '/list');
@@ -985,19 +781,15 @@ app.get('/health', (req, res) => {
 });
 
 // Share page
-app.get('/share/:id', asyncHandler(async (req, res) => {
+app.get('/share/:id', (req, res) => {
   const id = String(req.params.id || '').trim();
 
   if (matches.has(id)) {
     const rec = matches.get(id);
-    if (rec && isFresh(rec)) {
-      return renderSharePage(res, rec, id);
+    if (!rec || !isFresh(rec)) {
+      return res.status(404).send('Snapshot not found');
     }
-  }
-
-  const persisted = await getPersistedFinalByMatchId(id);
-  if (persisted) {
-    return renderSharePage(res, persisted, id);
+    return renderSharePage(res, rec, id);
   }
 
   const tokenMatches = getMatchesForToken(id);
@@ -1011,11 +803,11 @@ app.get('/share/:id', asyncHandler(async (req, res) => {
   }
 
   return renderTokenSelectionPage(res, tokenMatches);
-}));
+});
 
 // List page
-app.get('/list', asyncHandler(async (req, res) => {
-  const items = await listVisibleMatches();
+app.get('/list', (req, res) => {
+  const items = listFreshMatches();
 
   const html = `<!doctype html>
 <html lang="fi">
@@ -1034,7 +826,7 @@ app.get('/list', asyncHandler(async (req, res) => {
     .wrap {
       max-width: 980px;
       margin: 20px auto;
-      padding: 0 16px;
+      padding: 0 16px 20px;
     }
     h1 {
       font-size: 22px;
@@ -1089,16 +881,21 @@ app.get('/list', asyncHandler(async (req, res) => {
       padding: 12px 0;
       color: #666;
     }
+    .note {
+      margin-top: 14px;
+      color: #666;
+      font-size: 12px;
+    }
   </style>
 </head>
 <body>
   <div class="wrap">
     <h1>Liveseuranta – ottelut (${items.length})</h1>
-    <div class="hint">Näytetään aktiiviset ottelut sekä tallennetut lopputulokset.</div>
+    <div class="hint">Näytetään aktiiviset ottelut ja muistissa säilyvät lopputulokset.</div>
 
     ${
       items.length === 0
-        ? '<div class="empty">Otteluseurannassa ei ole käynnissä olevia otteluita eikä tallennettuja lopputuloksia.</div>'
+        ? '<div class="empty">Otteluseurannassa ei ole käynnissä olevia otteluita eikä näkyviä lopputuloksia.</div>'
         : `<table>
             <thead>
               <tr>
@@ -1117,7 +914,7 @@ app.get('/list', asyncHandler(async (req, res) => {
                   timeStyle: 'medium'
                 });
                 const score = `${Number(i.scoreHome ?? 0)} – ${Number(i.scoreAway ?? 0)}`;
-                const statusFi = statusLabelFi(i.status);
+                const statusFi = getStatusLabelFi(i.status);
                 const mid = encodeURIComponent(i.matchId);
 
                 return `<tr>
@@ -1135,7 +932,11 @@ app.get('/list', asyncHandler(async (req, res) => {
     }
 
     <div class="footer-link">
-      <a href="/privacy">Tietosuojaseloste</a>
+      <a href="/privacy">Privacy Policy / Tietosuojaseloste</a>
+    </div>
+
+    <div class="note">
+      Huom: tiedot ovat edelleen vain muistissa. Renderin restart tai uusi deploy tyhjentää ottelut.
     </div>
   </div>
 </body>
@@ -1144,16 +945,16 @@ app.get('/list', asyncHandler(async (req, res) => {
   res.setHeader('Content-Type', 'text/html; charset=utf-8');
   res.setHeader('Cache-Control', 'no-store');
   res.send(html);
-}));
+});
 
 // Privacy Policy
 app.get('/privacy', (req, res) => {
   const html = `<!doctype html>
-<html lang="fi">
+<html lang="en">
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Tietosuojaseloste</title>
+  <title>Privacy Policy</title>
   <style>
     body {
       margin: 0;
@@ -1198,55 +999,50 @@ app.get('/privacy', (req, res) => {
 <body>
   <div class="wrap">
     <div class="card">
-      <h1>Tietosuojaseloste</h1>
-      <p class="muted">Viimeksi päivitetty: ${new Date().toISOString().slice(0, 10)}</p>
+      <h1>Privacy Policy</h1>
+      <p class="muted">Last updated: ${new Date().toISOString().slice(0, 10)}</p>
 
       <p>
-        Tämä tietosuojaseloste koskee tätä live-seurantasovellusta ja siihen liittyvää verkkopalvelua.
+        This app and related web service are used for displaying football match live tracking data.
       </p>
 
-      <h2>1. Mitä tietoja sovellus käsittelee</h2>
+      <h2>1. Personal data</h2>
       <p>
-        Sovellus käsittelee vain otteluiden live-seurantaan liittyviä teknisiä ja sisällöllisiä tietoja,
-        kuten joukkueiden nimet, tulokset, ottelun tilatiedot ja muut ottelutapahtumatiedot.
+        This app does not collect, store, or process personal data. The app does not include user
+        registration, user accounts, or login functionality.
       </p>
 
-      <h2>2. Henkilötiedot</h2>
+      <h2>2. Analytics and tracking</h2>
       <p>
-        Sovellus ei kerää, tallenna eikä käsittele henkilötietoja. Sovelluksessa ei ole käyttäjätilien
-        luontia, kirjautumista eikä käyttäjäprofiileja.
+        This app does not use analytics, advertising tracking, or other tools for monitoring user behavior.
       </p>
 
-      <h2>3. Analytiikka ja seuranta</h2>
+      <h2>3. Data processed by the service</h2>
       <p>
-        Sovellus ei käytä analytiikkaa, mainosseurantaa eikä muita käyttäjän käyttäytymistä seuraavia työkaluja.
+        The service processes only match-related technical and content data, such as team names, scores,
+        match status, and other match event information required to provide the live tracking feature.
       </p>
 
-      <h2>4. Tietojen käyttötarkoitus</h2>
+      <h2>4. Purpose of processing</h2>
       <p>
-        Käsiteltäviä tietoja käytetään ainoastaan sovelluksen ydintoimintojen toteuttamiseen, kuten
-        live-otteluseurannan näyttämiseen ja otteluiden lopputulosten tallentamiseen.
+        The processed data is used only to provide the core functionality of the service, including live
+        match tracking and displaying match results.
       </p>
 
-      <h2>5. Tietojen luovutus</h2>
+      <h2>5. Data sharing</h2>
       <p>
-        Tietoja ei myydä eikä luovuteta kolmansille osapuolille muussa tarkoituksessa. Tietoja voidaan
-        käsitellä vain siinä laajuudessa kuin palvelun tekninen ylläpito sitä edellyttää.
+        Data is not sold to third parties. Data may be handled only to the extent necessary for technical
+        hosting and operation of the service.
       </p>
 
-      <h2>6. Tietoturva</h2>
+      <h2>6. Contact</h2>
       <p>
-        Palvelun toiminnassa pyritään käyttämään asianmukaisia teknisiä ja organisatorisia suojatoimia.
-      </p>
-
-      <h2>7. Yhteydenotot</h2>
-      <p>
-        Jos sinulla on kysyttävää tästä tietosuojaselosteesta, voit ottaa yhteyttä sähköpostitse:
+        If you have questions about this Privacy Policy, you can contact:
         <a href="mailto:johannes.rimpilainen@leasegreen.com">johannes.rimpilainen@leasegreen.com</a>
       </p>
 
       <p>
-        <a href="/list">← Takaisin ottelulistaan</a>
+        <a href="/list">← Back to match list</a>
       </p>
     </div>
   </div>
@@ -1258,66 +1054,36 @@ app.get('/privacy', (req, res) => {
   res.send(html);
 });
 
-// Admin: list persisted finals
-app.get('/api/admin/finals', requireAdmin, asyncHandler(async (req, res) => {
-  const items = await listPersistedFinals();
+// Admin: list current in-memory matches
+app.get('/api/admin/matches', requireAdmin, (req, res) => {
+  const items = listFreshMatches();
   res.set('Cache-Control', 'no-store');
   res.json({ items });
-}));
+});
 
-// Admin: delete persisted final
-app.delete('/api/admin/finals/:matchId', requireAdmin, asyncHandler(async (req, res) => {
+// Admin: delete current in-memory match
+app.delete('/api/admin/matches/:matchId', requireAdmin, (req, res) => {
   const matchId = String(req.params.matchId || '').trim();
 
   if (!matchId) {
     return res.status(400).json({ error: 'Missing matchId' });
   }
 
-  const existing = await getPersistedFinalByMatchId(matchId);
-  if (!existing) {
-    return res.status(404).json({ error: 'Final result not found' });
-  }
-
-  const result = await softDeleteFinal(matchId);
-
-  const liveRec = matches.get(matchId);
-  if (liveRec && (getStatus(liveRec) === 'final' || liveRec.isEnded)) {
-    matches.delete(matchId);
-    if (liveRec.token) {
-      removeMatchFromToken(String(liveRec.token), matchId);
-    }
+  const ok = deleteMatch(matchId);
+  if (!ok) {
+    return res.status(404).json({ error: 'Match not found' });
   }
 
   res.set('Cache-Control', 'no-store');
   res.json({
     ok: true,
-    matchId,
-    deletedAt: result.deletedAt
+    matchId
   });
-}));
+});
 
 app.use(express.static(path.join(__dirname, 'public')));
 
-app.use((err, req, res, next) => {
-  console.error('Unhandled error', err);
-
-  if (res.headersSent) {
-    return next(err);
-  }
-
-  res.status(500).json({ error: 'Internal server error' });
-});
-
 const PORT = process.env.PORT || 10000;
-
-initDb()
-  .then(() => {
-    app.listen(PORT, () => {
-      console.log(`Server listening on port ${PORT}`);
-      console.log(`Final results DB: ${FINAL_DB_PATH}`);
-    });
-  })
-  .catch((err) => {
-    console.error('Failed to initialize database', err);
-    process.exit(1);
-  });
+app.listen(PORT, () => {
+  console.log(`Server listening on port ${PORT}`);
+});
